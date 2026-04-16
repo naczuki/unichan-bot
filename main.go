@@ -21,9 +21,14 @@ import (
 )
 
 const (
-	relayURL  = "wss://nos.lol"
 	statusAPI = "https://status.claude.com/api/v2/summary.json"
 )
+
+var postRelays = []string{
+	"wss://nos.lol",
+	"wss://yabu.me",
+	"wss://relay.nostr.wirednet.jp",
+}
 
 var targetComponents = []string{
 	"claude.ai",
@@ -47,17 +52,26 @@ func decodeNsec(nsec string) string {
 }
 
 func publishEvent(ctx context.Context, ev nostr.Event) {
-	relay, err := nostr.RelayConnect(ctx, relayURL)
-	if err != nil {
-		log.Printf("❌ Connect failed: %v", err)
-		return
+	var wg sync.WaitGroup
+	for _, url := range postRelays {
+		url := url
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			relay, err := nostr.RelayConnect(ctx, url)
+			if err != nil {
+				log.Printf("❌ Connect failed (%s): %v", url, err)
+				return
+			}
+			defer relay.Close()
+			if err := relay.Publish(ctx, ev); err != nil {
+				log.Printf("❌ Publish failed (%s): %v", url, err)
+				return
+			}
+			log.Printf("✅ Published (%s): %s", url, ev.ID)
+		}()
 	}
-	defer relay.Close()
-	if err := relay.Publish(ctx, ev); err != nil {
-		log.Printf("❌ Publish failed: %v", err)
-		return
-	}
-	log.Printf("✅ Published: %s", ev.ID)
+	wg.Wait()
 }
 
 // ── Status ─────────────────────────────────────────────
@@ -240,14 +254,14 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 		default:
 		}
 
-		log.Printf("Connecting to %s ...", relayURL)
-		relay, err := nostr.RelayConnect(ctx, relayURL)
+		log.Printf("Connecting to %s ...", postRelays[0])
+		relay, err := nostr.RelayConnect(ctx, postRelays[0])
 		if err != nil {
 			log.Printf("❌ Connect failed: %v, retrying in 10s", err)
 			time.Sleep(10 * time.Second)
 			continue
 		}
-		log.Printf("✅ Connected to %s", relayURL)
+		log.Printf("✅ Connected to %s", postRelays[0])
 
 		since := nostr.Timestamp(time.Now().Unix())
 		filters := []nostr.Filter{{
@@ -269,15 +283,18 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 		for ev := range sub.Events {
 			log.Printf("📨 Mention from %s: %s", ev.PubKey, ev.Content)
 			lower := strings.ToLower(ev.Content)
-			if !strings.Contains(lower, "ステータス") && !strings.Contains(lower, "status") {
-				log.Printf("⏭️ Skipped (no keyword)")
-				continue
-			}
 			go func(ev *nostr.Event) {
-				msg, err := buildStatusMessage()
-				if err != nil {
-					log.Printf("❌ buildStatusMessage: %v", err)
-					return
+				var msg string
+				if strings.Contains(lower, "ステータス") || strings.Contains(lower, "status") {
+					var err error
+					msg, err = buildStatusMessage()
+					if err != nil {
+						log.Printf("❌ buildStatusMessage: %v", err)
+						return
+					}
+				} else {
+					cries := []string{"うにー！", "うににー！", "うにちゃん！"}
+					msg = cries[time.Now().UnixNano()%3]
 				}
 				reply := nostr.Event{
 					Kind:      nostr.KindTextNote,
