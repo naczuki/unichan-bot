@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	relayURL    = "wss://nos.lol"
-	statusAPI   = "https://status.claude.com/api/v2/summary.json"
+	relayURL  = "wss://nos.lol"
+	statusAPI = "https://status.claude.com/api/v2/summary.json"
 )
 
 var targetComponents = []string{
@@ -34,12 +34,16 @@ var targetComponents = []string{
 
 // ── Nostr ──────────────────────────────────────────────
 
-func decodeNsec(nsec string) []byte {
+func decodeNsec(nsec string) string {
 	_, data, err := nip19.Decode(strings.TrimSpace(nsec))
 	if err != nil {
 		log.Fatalf("Failed to decode nsec: %v", err)
 	}
-	return data.([]byte)
+	skHex, ok := data.(string)
+	if !ok {
+		log.Fatalf("Unexpected type from nip19.Decode: %T", data)
+	}
+	return skHex
 }
 
 func publishEvent(ctx context.Context, ev nostr.Event) {
@@ -121,10 +125,9 @@ func buildStatusMessage() (string, error) {
 				break
 			}
 		}
-		displayName := name
 		lines = append(lines, fmt.Sprintf("%s %s - %s",
 			componentEmoji(status),
-			displayName,
+			name,
 			strings.ReplaceAll(status, "_", " "),
 		))
 	}
@@ -133,7 +136,7 @@ func buildStatusMessage() (string, error) {
 		lines = append(lines, "", "【インシデント】")
 		for _, inc := range s.Incidents {
 			lines = append(lines, fmt.Sprintf("%s %s", incidentEmoji(inc.Status), inc.Name))
-			lines = append(lines, fmt.Sprintf("　- %s", strings.Title(inc.Status)))
+			lines = append(lines, fmt.Sprintf("　- %s", strings.ToUpper(inc.Status[:1])+inc.Status[1:]))
 			if inc.Shortlink != "" {
 				lines = append(lines, fmt.Sprintf("　🖇️ %s", inc.Shortlink))
 			}
@@ -165,9 +168,11 @@ func cleanComponentName(name string) string {
 	return name
 }
 
-func formatComponents(components []struct {
+type ComponentItem struct {
 	Name string `json:"name"`
-}) string {
+}
+
+func formatComponents(components []ComponentItem) string {
 	if len(components) == 0 {
 		return ""
 	}
@@ -200,7 +205,7 @@ func newDB(path string) (*DB, error) {
 	}
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS webhook_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		incident_key TEXT NOT NULL,
+		incident_key TEXT NOT NULL UNIQUE,
 		received_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 	if err != nil {
@@ -209,29 +214,25 @@ func newDB(path string) (*DB, error) {
 	return &DB{db: db}, nil
 }
 
-func (d *DB) isDuplicate(incidentKey string) (bool, error) {
+func (d *DB) isDuplicate(key string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM webhook_logs WHERE incident_key = ?`, incidentKey).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM webhook_logs WHERE incident_key = ?`, key).Scan(&count)
+	return count > 0, err
 }
 
-func (d *DB) record(incidentKey string) error {
+func (d *DB) record(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec(`INSERT INTO webhook_logs (incident_key) VALUES (?)`, incidentKey)
-	// 直近100件だけ保持
+	_, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
 	d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 100)`)
 	return err
 }
 
 // ── メンション購読 ─────────────────────────────────────
 
-func subscribeMentions(ctx context.Context, sk []byte, myPubkey string) {
+func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,7 +283,7 @@ func subscribeMentions(ctx context.Context, sk []byte, myPubkey string) {
 					},
 					Content: msg,
 				}
-				if err := reply.Sign(fmt.Sprintf("%x", sk)); err != nil {
+				if err := reply.Sign(skHex); err != nil {
 					log.Printf("❌ Sign failed: %v", err)
 					return
 				}
@@ -301,14 +302,12 @@ func subscribeMentions(ctx context.Context, sk []byte, myPubkey string) {
 type WebhookPayload struct {
 	ComponentUpdate *struct{} `json:"component_update"`
 	Incident        *struct {
-		ID             string `json:"id"`
-		UpdatedAt      string `json:"updated_at"`
-		Name           string `json:"name"`
-		Status         string `json:"status"`
-		Shortlink      string `json:"shortlink"`
-		Components     []struct {
-			Name string `json:"name"`
-		} `json:"components"`
+		ID              string          `json:"id"`
+		UpdatedAt       string          `json:"updated_at"`
+		Name            string          `json:"name"`
+		Status          string          `json:"status"`
+		Shortlink       string          `json:"shortlink"`
+		Components      []ComponentItem `json:"components"`
 		IncidentUpdates []struct {
 			Body string `json:"body"`
 		} `json:"incident_updates"`
@@ -319,11 +318,11 @@ type WebhookPayload struct {
 	} `json:"page"`
 }
 
-func webhookHandler(db *DB, sk []byte, ctx context.Context) http.HandlerFunc {
+func webhookHandler(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, "OK (POST only)")
+			fmt.Fprint(w, "OK")
 			return
 		}
 
@@ -339,7 +338,6 @@ func webhookHandler(db *DB, sk []byte, ctx context.Context) http.HandlerFunc {
 			return
 		}
 
-		// component_update は無視
 		if payload.ComponentUpdate != nil {
 			fmt.Fprint(w, "Ignored (component_update)")
 			return
@@ -349,8 +347,6 @@ func webhookHandler(db *DB, sk []byte, ctx context.Context) http.HandlerFunc {
 
 		if payload.Incident != nil {
 			inc := payload.Incident
-
-			// 重複チェック
 			key := fmt.Sprintf("%s:%s", inc.ID, inc.UpdatedAt)
 			dup, err := db.isDuplicate(key)
 			if err != nil {
@@ -392,7 +388,7 @@ func webhookHandler(db *DB, sk []byte, ctx context.Context) http.HandlerFunc {
 			Tags:      nostr.Tags{},
 			Content:   content,
 		}
-		if err := ev.Sign(fmt.Sprintf("%x", sk)); err != nil {
+		if err := ev.Sign(skHex); err != nil {
 			log.Printf("❌ Sign failed: %v", err)
 			http.Error(w, "sign error", http.StatusInternalServerError)
 			return
@@ -410,15 +406,9 @@ func main() {
 	if nsec == "" {
 		log.Fatal("MY_NSEC is required")
 	}
-	sk := decodeNsec(nsec)
 
-	// pubkey取得
-	_, pubkeyData, err := nip19.Decode(strings.TrimSpace(nsec))
-	if err != nil {
-		log.Fatalf("Failed to decode nsec: %v", err)
-	}
-	skBytes := pubkeyData.([]byte)
-	pubkey, err := nostr.GetPublicKey(fmt.Sprintf("%x", skBytes))
+	skHex := decodeNsec(nsec)
+	pubkey, err := nostr.GetPublicKey(skHex)
 	if err != nil {
 		log.Fatalf("Failed to get pubkey: %v", err)
 	}
@@ -436,15 +426,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// メンション購読（goroutine）
-	go subscribeMentions(ctx, sk, pubkey)
+	go subscribeMentions(ctx, skHex, pubkey)
 
-	// Webhook HTTPサーバー
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", webhookHandler(db, sk, ctx))
+	http.HandleFunc("/", webhookHandler(db, skHex, ctx))
 	srv := &http.Server{Addr: ":" + port}
 
 	go func() {
