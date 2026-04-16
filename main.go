@@ -268,6 +268,11 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 
 		for ev := range sub.Events {
 			log.Printf("📨 Mention from %s: %s", ev.PubKey, ev.Content)
+			lower := strings.ToLower(ev.Content)
+			if !strings.Contains(lower, "ステータス") && !strings.Contains(lower, "status") {
+				log.Printf("⏭️ Skipped (no keyword)")
+				continue
+			}
 			go func(ev *nostr.Event) {
 				msg, err := buildStatusMessage()
 				if err != nil {
