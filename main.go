@@ -254,15 +254,8 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 		default:
 		}
 
-		log.Printf("Connecting to %s ...", postRelays[0])
-		relay, err := nostr.RelayConnect(ctx, postRelays[0])
-		if err != nil {
-			log.Printf("❌ Connect failed: %v, retrying in 10s", err)
-			time.Sleep(10 * time.Second)
-			continue
-		}
-		log.Printf("✅ Connected to %s", postRelays[0])
-
+		log.Printf("📡 Subscribing to mentions via SimplePool...")
+		pool := nostr.NewSimplePool(ctx)
 		since := nostr.Timestamp(time.Now().Unix())
 		filters := []nostr.Filter{{
 			Kinds: []int{nostr.KindTextNote},
@@ -270,17 +263,12 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			Since: &since,
 		}}
 
-		sub, err := relay.Subscribe(ctx, filters)
-		if err != nil {
-			log.Printf("❌ Subscribe failed: %v", err)
-			relay.Close()
-			time.Sleep(10 * time.Second)
-			continue
-		}
-
+		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp"}
+		events := pool.SubMany(ctx, subRelays, filters)
 		log.Printf("📡 Subscribed to mentions for %s", myPubkey)
 
-		for ev := range sub.Events {
+		for ie := range events {
+			ev := ie.Event
 			log.Printf("📨 Mention from %s: %s", ev.PubKey, ev.Content)
 			lower := strings.ToLower(ev.Content)
 			go func(ev *nostr.Event) {
@@ -313,8 +301,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			}(ev)
 		}
 
-		log.Printf("⚠️ Subscription ended, reconnecting in 5s")
-		relay.Close()
+		log.Printf("⚠️ SubMany ended, reconnecting in 5s")
 		time.Sleep(5 * time.Second)
 	}
 }
