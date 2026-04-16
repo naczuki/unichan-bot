@@ -1,24 +1,23 @@
-# fly.toml app configuration file generated for unichan-bot on 2026-04-16T14:34:54Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'unichan-bot'
-primary_region = 'iad'
+app = "unichan-bot"
+primary_region = "nrt"
 
 [build]
+
+[env]
+  DB_PATH = "/data/unychan.db"
+  PORT = "8080"
+
+[mounts]
+  source = "unychan_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+  min_machines_running = 1
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 1024
-
+  size = "shared-cpu-1x"
+  memory = "256mb"
