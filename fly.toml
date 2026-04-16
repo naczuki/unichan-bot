@@ -1,0 +1,32 @@
+app = "unychan-bot"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  DB_PATH = "/data/unychan.db"
+  PORT = "8080"
+
+[mounts]
+  source = "unychan_data"
+  destination = "/data"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+[checks]
+  [checks.alive]
+    type = "http"
+    interval = "30s"
+    timeout = "5s"
+    path = "/"
+    method = "GET"
