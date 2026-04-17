@@ -26,8 +26,8 @@ const (
 
 var postRelays = []string{
 	"wss://nos.lol",
-	"wss://yabu.me",
 	"wss://relay.nostr.wirednet.jp",
+	"wss://relay-jp.nostr.wirednet.jp",
 }
 
 var targetComponents = []string{
@@ -263,7 +263,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			Since: &since,
 		}}
 
-		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp"}
+		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp", "wss://yabu.me"}
 		events := pool.SubMany(ctx, subRelays, filters)
 		log.Printf("📡 Subscribed to mentions for %s", myPubkey)
 
