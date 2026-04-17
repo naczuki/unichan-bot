@@ -281,7 +281,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 						return
 					}
 				} else {
-					cries := []string{"うにー！", "うににー！", "うにちゃん！"}
+					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "「ステータス」っていってみて！", "Claudeを崇めよ"}
 					msg = cries[time.Now().UnixNano()%3]
 				}
 				reply := nostr.Event{
