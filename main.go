@@ -82,6 +82,8 @@ type StatusSummary struct {
 		Status string `json:"status"`
 	} `json:"components"`
 	Incidents []struct {
+		ID        string `json:"id"`
+		UpdatedAt string `json:"updated_at"`
 		Name      string `json:"name"`
 		Status    string `json:"status"`
 		Shortlink string `json:"shortlink"`
@@ -242,6 +244,84 @@ func (d *DB) record(key string) error {
 	_, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
 	d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 100)`)
 	return err
+}
+
+func (d *DB) isPolledDuplicate(key string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM polled_incidents WHERE incident_key = ?`, key).Scan(&count)
+	return count > 0, err
+}
+
+func (d *DB) recordPolled(key string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec(`INSERT OR IGNORE INTO polled_incidents (incident_key) VALUES (?)`, key)
+	d.db.Exec(`DELETE FROM polled_incidents WHERE id NOT IN (SELECT id FROM polled_incidents ORDER BY id DESC LIMIT 200)`)
+	return err
+}
+
+// ── インシデントポーリング ────────────────────────────
+
+func pollIncidents(ctx context.Context, db *DB, skHex string) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// 起動時に一度実行
+	checkIncidents(ctx, db, skHex)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkIncidents(ctx, db, skHex)
+		}
+	}
+}
+
+func checkIncidents(ctx context.Context, db *DB, skHex string) {
+	s, err := fetchStatus()
+	if err != nil {
+		log.Printf("❌ pollIncidents fetchStatus: %v", err)
+		return
+	}
+
+	for _, inc := range s.Incidents {
+		key := fmt.Sprintf("poll:%s:%s", inc.ID, inc.UpdatedAt)
+		dup, err := db.isPolledDuplicate(key)
+		if err != nil {
+			log.Printf("❌ pollIncidents DB: %v", err)
+			continue
+		}
+		if dup {
+			continue
+		}
+
+		log.Printf("📋 New incident via polling: %s (%s)", inc.Name, inc.Status)
+		db.recordPolled(key)
+
+		lines := []string{"ステータスが更新されたよ！", ""}
+		lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
+		lines = append(lines, formatStatus(inc.Status))
+		if inc.Shortlink != "" {
+			lines = append(lines, fmt.Sprintf("🔗 %s", inc.Shortlink))
+		}
+
+		content := strings.Join(lines, "\n")
+		ev := nostr.Event{
+			Kind:      nostr.KindTextNote,
+			CreatedAt: nostr.Timestamp(time.Now().Unix()),
+			Tags:      nostr.Tags{},
+			Content:   content,
+		}
+		if err := ev.Sign(skHex); err != nil {
+			log.Printf("❌ pollIncidents Sign: %v", err)
+			continue
+		}
+		go publishEvent(ctx, ev)
+	}
 }
 
 // ── メンション購読 ─────────────────────────────────────
