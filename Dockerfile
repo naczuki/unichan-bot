@@ -6,7 +6,7 @@ COPY main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -o unychan .
 
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates sqlite
 WORKDIR /app
 COPY --from=builder /app/unychan .
 RUN mkdir -p /data
