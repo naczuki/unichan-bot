@@ -227,6 +227,14 @@ func newDB(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS polled_incidents (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		incident_key TEXT UNIQUE NOT NULL,
+		posted_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`)
+	if err != nil {
+		return nil, err
+	}
 	return &DB{db: db}, nil
 }
 
