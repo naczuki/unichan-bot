@@ -276,9 +276,6 @@ func pollIncidents(ctx context.Context, db *DB, skHex string) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	// 起動時に一度実行
-	checkIncidents(ctx, db, skHex)
-
 	for {
 		select {
 		case <-ctx.Done():
