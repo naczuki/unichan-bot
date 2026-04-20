@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	statusAPI = "https://status.claude.com/api/v2/summary.json"
+	statusAPI   = "https://status.claude.com/api/v2/summary.json"
+	incidentAPI = "https://status.claude.com/api/v2/incidents.json"
 )
 
 var postRelays = []string{
@@ -92,6 +93,32 @@ type StatusSummary struct {
 			Body string `json:"body"`
 		} `json:"incident_updates"`
 	} `json:"incidents"`
+}
+
+type IncidentSummary struct {
+	Incidents []struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Status    string `json:"status"`
+		Shortlink string `json:"shortlink"`
+		IncidentUpdates []struct {
+			ID   string `json:"id"`
+			Body string `json:"body"`
+		} `json:"incident_updates"`
+	} `json:"incidents"`
+}
+
+func fetchIncidents() (*IncidentSummary, error) {
+	resp, err := http.Get(incidentAPI)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var s IncidentSummary
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return nil, err
+	}
+	return &s, nil
 }
 
 func fetchStatus() (*StatusSummary, error) {
@@ -291,9 +318,9 @@ func pollIncidents(ctx context.Context, db *DB, skHex string) {
 }
 
 func checkIncidents(ctx context.Context, db *DB, skHex string) {
-	s, err := fetchStatus()
+	s, err := fetchIncidents()
 	if err != nil {
-		log.Printf("❌ pollIncidents fetchStatus: %v", err)
+		log.Printf("❌ pollIncidents fetchIncidents: %v", err)
 		return
 	}
 
