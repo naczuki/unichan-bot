@@ -525,6 +525,9 @@ func main() {
 
 	go subscribeMentions(ctx, skHex, pubkey)
 
+	// インシデントポーリング（goroutine）
+	go pollIncidents(ctx, db, skHex)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
