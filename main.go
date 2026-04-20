@@ -297,7 +297,7 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 	}
 
 	for _, inc := range s.Incidents {
-		key := fmt.Sprintf("poll:%s:%s", inc.ID, inc.UpdatedAt)
+		key := fmt.Sprintf("poll:%s:%s", inc.ID, inc.Status)
 		dup, err := db.isPolledDuplicate(key)
 		if err != nil {
 			log.Printf("❌ pollIncidents DB: %v", err)
