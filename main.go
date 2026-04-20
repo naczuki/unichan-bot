@@ -87,6 +87,10 @@ type StatusSummary struct {
 		Name      string `json:"name"`
 		Status    string `json:"status"`
 		Shortlink string `json:"shortlink"`
+		IncidentUpdates []struct {
+			ID   string `json:"id"`
+			Body string `json:"body"`
+		} `json:"incident_updates"`
 	} `json:"incidents"`
 }
 
@@ -294,7 +298,11 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 	}
 
 	for _, inc := range s.Incidents {
-		key := fmt.Sprintf("poll:%s:%s", inc.ID, inc.Status)
+		if len(inc.IncidentUpdates) == 0 {
+			continue
+		}
+		latestUpdate := inc.IncidentUpdates[0]
+		key := fmt.Sprintf("poll:%s:%s", inc.ID, latestUpdate.ID)
 		dup, err := db.isPolledDuplicate(key)
 		if err != nil {
 			log.Printf("❌ pollIncidents DB: %v", err)
@@ -310,6 +318,9 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 		lines := []string{"ステータスが更新されたよ！", ""}
 		lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
 		lines = append(lines, formatStatus(inc.Status))
+		if latestUpdate.Body != "" {
+			lines = append(lines, "", fmt.Sprintf("💬 %s", latestUpdate.Body))
+		}
 		if inc.Shortlink != "" {
 			lines = append(lines, fmt.Sprintf("🔗 %s", inc.Shortlink))
 		}
