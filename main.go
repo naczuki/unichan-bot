@@ -98,6 +98,7 @@ type StatusSummary struct {
 type IncidentSummary struct {
 	Incidents []struct {
 		ID        string `json:"id"`
+		UpdatedAt string `json:"updated_at"`
 		Name      string `json:"name"`
 		Status    string `json:"status"`
 		Shortlink string `json:"shortlink"`
@@ -324,11 +325,18 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 		return
 	}
 
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+
 	for _, inc := range s.Incidents {
 		if len(inc.IncidentUpdates) == 0 {
 			continue
 		}
 		latestUpdate := inc.IncidentUpdates[0]
+		// 24時間以上前のインシデントはスキップ
+		updatedAt, err := time.Parse(time.RFC3339, inc.UpdatedAt)
+		if err != nil || updatedAt.Before(cutoff) {
+			continue
+		}
 		key := fmt.Sprintf("poll:%s:%s", inc.ID, latestUpdate.ID)
 		dup, err := db.isPolledDuplicate(key)
 		if err != nil {
@@ -450,7 +458,14 @@ type WebhookPayload struct {
 	} `json:"page"`
 }
 
-func webhookHandler(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
+func webhookHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
+	}
+}
+
+func webhookHandler_unused(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusOK)
@@ -567,7 +582,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", webhookHandler(db, skHex, ctx))
+	http.HandleFunc("/", webhookHandler())
 	srv := &http.Server{Addr: ":" + port}
 
 	go func() {
