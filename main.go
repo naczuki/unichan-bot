@@ -168,7 +168,7 @@ func buildStatusMessage() (string, error) {
 	for _, name := range targetComponents {
 		status := "unknown"
 		for _, c := range s.Components {
-			if strings.HasPrefix(c.Name, name) {
+			if strings.Contains(c.Name, name) {
 				status = c.Status
 				break
 			}
