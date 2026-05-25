@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,8 +53,9 @@ func decodeNsec(nsec string) string {
 	return skHex
 }
 
-func publishEvent(ctx context.Context, ev nostr.Event) {
+func publishEvent(ctx context.Context, ev nostr.Event) bool {
 	var wg sync.WaitGroup
+	var successCount int32
 	for _, url := range postRelays {
 		url := url
 		wg.Add(1)
@@ -70,9 +72,11 @@ func publishEvent(ctx context.Context, ev nostr.Event) {
 				return
 			}
 			log.Printf("✅ Published (%s): %s", url, ev.ID)
+			atomic.AddInt32(&successCount, 1)
 		}()
 	}
 	wg.Wait()
+	return atomic.LoadInt32(&successCount) > 0
 }
 
 // ── Status ─────────────────────────────────────────────
@@ -115,6 +119,10 @@ func fetchIncidents() (*IncidentSummary, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("incidents API returned %d: %s", resp.StatusCode, string(body))
+	}
 	var s IncidentSummary
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		return nil, err
@@ -128,6 +136,10 @@ func fetchStatus() (*StatusSummary, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status API returned %d: %s", resp.StatusCode, string(body))
+	}
 	var s StatusSummary
 	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
 		return nil, err
@@ -348,7 +360,6 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 		}
 
 		log.Printf("📋 New incident via polling: %s (%s)", inc.Name, inc.Status)
-		db.recordPolled(key)
 
 		lines := []string{"ステータスが更新されたよ！", ""}
 		lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
@@ -371,7 +382,11 @@ func checkIncidents(ctx context.Context, db *DB, skHex string) {
 			log.Printf("❌ pollIncidents Sign: %v", err)
 			continue
 		}
-		go publishEvent(ctx, ev)
+		if publishEvent(ctx, ev) {
+			db.recordPolled(key)
+		} else {
+			log.Printf("⚠️ All relays failed for %s, will retry next poll", inc.ID)
+		}
 	}
 }
 
