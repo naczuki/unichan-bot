@@ -473,14 +473,7 @@ type WebhookPayload struct {
 	} `json:"page"`
 }
 
-func webhookHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "OK")
-	}
-}
-
-func webhookHandler_unused(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
+func webhookHandler(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusOK)
@@ -506,11 +499,12 @@ func webhookHandler_unused(db *DB, skHex string, ctx context.Context) http.Handl
 		}
 
 		var lines []string
+		var dedupKey string
 
 		if payload.Incident != nil {
 			inc := payload.Incident
-			key := fmt.Sprintf("%s:%s", inc.ID, inc.UpdatedAt)
-			dup, err := db.isDuplicate(key)
+			dedupKey = fmt.Sprintf("%s:%s", inc.ID, inc.UpdatedAt)
+			dup, err := db.isDuplicate(dedupKey)
 			if err != nil {
 				log.Printf("❌ DB error: %v", err)
 			}
@@ -518,7 +512,8 @@ func webhookHandler_unused(db *DB, skHex string, ctx context.Context) http.Handl
 				fmt.Fprint(w, "Ignored (duplicate)")
 				return
 			}
-			db.record(key)
+
+			log.Printf("📋 Webhook incident: %s (%s)", inc.Name, inc.Status)
 
 			lines = append(lines, "ステータスが更新されたよ！", "")
 			lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
@@ -556,8 +551,15 @@ func webhookHandler_unused(db *DB, skHex string, ctx context.Context) http.Handl
 			return
 		}
 
-		go publishEvent(ctx, ev)
-		fmt.Fprint(w, "Posted!")
+		if publishEvent(ctx, ev) {
+			if dedupKey != "" {
+				db.record(dedupKey)
+			}
+			fmt.Fprint(w, "Posted!")
+		} else {
+			log.Printf("⚠️ All relays failed for webhook")
+			http.Error(w, "publish failed", http.StatusInternalServerError)
+		}
 	}
 }
 
@@ -597,7 +599,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", webhookHandler())
+	http.HandleFunc("/", webhookHandler(db, skHex, ctx))
 	srv := &http.Server{Addr: ":" + port}
 
 	go func() {
