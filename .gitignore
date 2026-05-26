@@ -1,1 +1,3 @@
 unychan
+*.db
+.env*
