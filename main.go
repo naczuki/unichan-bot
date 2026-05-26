@@ -596,8 +596,8 @@ func main() {
 
 	go subscribeMentions(ctx, skHex, pubkey)
 
-	// インシデントポーリング（goroutine）
-	go pollIncidents(ctx, db, skHex)
+	// インシデントポーリング（現在CAPTCHA保護により無効化、Webhook併用中）
+	// go pollIncidents(ctx, db, skHex)
 
 	port := os.Getenv("PORT")
 	if port == "" {
