@@ -294,7 +294,9 @@ func (d *DB) record(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
-	d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 100)`)
+	if _, delErr := d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 100)`); delErr != nil {
+		log.Printf("⚠️ webhook_logs cleanup failed: %v", delErr)
+	}
 	return err
 }
 
@@ -310,7 +312,9 @@ func (d *DB) recordPolled(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.db.Exec(`INSERT OR IGNORE INTO polled_incidents (incident_key) VALUES (?)`, key)
-	d.db.Exec(`DELETE FROM polled_incidents WHERE id NOT IN (SELECT id FROM polled_incidents ORDER BY id DESC LIMIT 200)`)
+	if _, delErr := d.db.Exec(`DELETE FROM polled_incidents WHERE id NOT IN (SELECT id FROM polled_incidents ORDER BY id DESC LIMIT 200)`); delErr != nil {
+		log.Printf("⚠️ polled_incidents cleanup failed: %v", delErr)
+	}
 	return err
 }
 
@@ -417,7 +421,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			ev := ie.Event
 			log.Printf("📨 Mention from %s: %s", ev.PubKey, ev.Content)
 			lower := strings.ToLower(ev.Content)
-			go func(ev *nostr.Event) {
+			go func(ev *nostr.Event, lower string) {
 				var msg string
 				if strings.Contains(lower, "ステータス") || strings.Contains(lower, "status") {
 					var err error
@@ -428,7 +432,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 					}
 				} else {
 					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "「ステータス」っていってみて！", "Claudeを崇めよ"}
-					msg = cries[time.Now().UnixNano()%3]
+					msg = cries[time.Now().UnixNano()%int64(len(cries))]
 				}
 				reply := nostr.Event{
 					Kind:      nostr.KindTextNote,
@@ -444,7 +448,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 					return
 				}
 				publishEvent(ctx, reply)
-			}(ev)
+			}(ev, lower)
 		}
 
 		log.Printf("⚠️ SubMany ended, reconnecting in 5s")
