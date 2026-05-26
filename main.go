@@ -477,7 +477,7 @@ type WebhookPayload struct {
 	} `json:"page"`
 }
 
-func webhookHandler(db *DB, skHex string, ctx context.Context) http.HandlerFunc {
+func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusOK)
@@ -603,7 +603,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", webhookHandler(db, skHex, ctx))
+	http.HandleFunc("/", webhookHandler(ctx, db, skHex))
 	srv := &http.Server{Addr: ":" + port}
 
 	go func() {
