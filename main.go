@@ -24,9 +24,8 @@ import (
 )
 
 const (
-	statusAPI     = "https://status.claude.com/api/v2/summary.json"
 	incidentAPI   = "https://status.claude.com/api/v2/incidents.json"
-	statusPageURL = "https://status.claude.com"
+	statusFeedURL = "https://status.claude.com/history.atom"
 	browserUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
@@ -34,13 +33,6 @@ var postRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
-}
-
-var targetComponents = []string{
-	"claude.ai",
-	"platform.claude.com",
-	"Claude API",
-	"Claude Code",
 }
 
 // ── Nostr ──────────────────────────────────────────────
@@ -134,17 +126,6 @@ func fetchIncidents() (*IncidentSummary, error) {
 	return &s, nil
 }
 
-func componentEmoji(status string) string {
-	switch status {
-	case "operational":
-		return "✅"
-	case "degraded_performance", "partial_outage":
-		return "⚠️"
-	default:
-		return "🔴"
-	}
-}
-
 func incidentEmoji(status string) string {
 	switch status {
 	case "resolved":
@@ -156,33 +137,35 @@ func incidentEmoji(status string) string {
 	}
 }
 
-// statuspageのstatus-colorクラスを内部ステータス文字列に変換する
-func colorToStatus(color string) string {
-	switch color {
-	case "green":
-		return "operational"
-	case "yellow", "blue":
-		return "degraded_performance"
-	case "orange":
-		return "partial_outage"
-	case "red":
-		return "major_outage"
+// インシデントのステータス文字列に絵文字を付ける
+func feedStatusEmoji(status string) string {
+	switch strings.ToLower(status) {
+	case "resolved", "completed":
+		return "✅"
+	case "investigating", "identified", "monitoring", "update", "in progress", "scheduled", "verifying":
+		return "🟡"
 	default:
-		return "unknown"
+		return "🔴"
 	}
 }
 
-// ステータスページのHTMLをブラウザUAでクロールし、
-// コンポーネント名 → ステータスのマップを返す。
-// botのUAだとAPI(summary.json)が弾かれるため、HTMLページを直接パースする。
-func crawlComponentStatuses() (map[string]string, error) {
-	req, err := http.NewRequest("GET", statusPageURL, nil)
+type feedIncident struct {
+	Title   string
+	Status  string // 最新の更新状態 (Resolved/Investigating/...)
+	Updated string // ISO8601
+	Link    string
+}
+
+// status.claude.com の Atom フィードを取得して最新インシデントを返す。
+// API(summary.json)やトップページHTMLはデータセンターIPからbot判定(405)で弾かれるが、
+// Atomフィードは取得できるため、こちらを使う。
+func fetchStatusFeed() ([]feedIncident, error) {
+	req, err := http.NewRequest("GET", statusFeedURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "ja,en;q=0.9")
+	req.Header.Set("Accept", "application/atom+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
@@ -191,41 +174,56 @@ func crawlComponentStatuses() (map[string]string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("status page returned %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return nil, fmt.Errorf("status feed returned %d: %s", resp.StatusCode, string(body))
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	html := string(body)
-	result := map[string]string{}
-	// 各コンポーネントブロック: class="component-inner-container status-<color> ..."
-	// その中の class="name ...">NAME< を対応づける
-	matches := componentBlockRe.FindAllStringSubmatch(html, -1)
-	for _, m := range matches {
-		color := m[1]
-		inner := m[2]
-		nm := componentNameRe.FindStringSubmatch(inner)
-		if nm == nil {
+	xmlText := string(body)
+	var incidents []feedIncident
+	for _, e := range entryRe.FindAllStringSubmatch(xmlText, -1) {
+		entry := e[1]
+		title := htmlUnescape(strings.TrimSpace(submatch(entryTitleRe, entry)))
+		updated := strings.TrimSpace(submatch(entryUpdatedRe, entry))
+		link := ""
+		if lm := entryLinkRe.FindStringSubmatch(entry); lm != nil {
+			link = lm[1]
+		}
+		// content内の最初の <strong>状態</strong> が最新の更新状態
+		status := "unknown"
+		if cm := entryContentRe.FindStringSubmatch(entry); cm != nil {
+			if sm := strongStateRe.FindStringSubmatch(cm[1]); sm != nil {
+				status = strings.TrimSpace(sm[1])
+			}
+		}
+		if title == "" {
 			continue
 		}
-		name := htmlUnescape(strings.TrimSpace(nm[1]))
-		if name == "" {
-			continue
-		}
-		result[name] = colorToStatus(color)
+		incidents = append(incidents, feedIncident{Title: title, Status: status, Updated: updated, Link: link})
 	}
-	if len(result) == 0 {
-		return nil, fmt.Errorf("no components parsed from status page")
+	if len(incidents) == 0 {
+		return nil, fmt.Errorf("no entries parsed from status feed")
 	}
-	return result, nil
+	return incidents, nil
+}
+
+func submatch(re *regexp.Regexp, s string) string {
+	if m := re.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 var (
-	componentBlockRe = regexp.MustCompile(`(?s)component-inner-container status-(\w+)[^>]*>(.*?)</div>\s*</div>`)
-	componentNameRe  = regexp.MustCompile(`(?s)class="name[^"]*"[^>]*>\s*([^<]+?)\s*<`)
+	entryRe         = regexp.MustCompile(`(?s)<entry>(.*?)</entry>`)
+	entryTitleRe    = regexp.MustCompile(`(?s)<title>(.*?)</title>`)
+	entryUpdatedRe  = regexp.MustCompile(`(?s)<updated>(.*?)</updated>`)
+	entryLinkRe     = regexp.MustCompile(`<link[^>]*href="([^"]+)"`)
+	entryContentRe  = regexp.MustCompile(`(?s)<content[^>]*>(.*?)</content>`)
+	strongStateRe   = regexp.MustCompile(`(?s)(?:&lt;|<)strong(?:&gt;|>)\s*(.*?)\s*(?:&lt;|<)/strong`)
 )
 
 func htmlUnescape(s string) string {
@@ -239,27 +237,47 @@ func htmlUnescape(s string) string {
 	return r.Replace(s)
 }
 
+// 状態が解決済みかどうか
+func isResolvedStatus(s string) bool {
+	switch strings.ToLower(s) {
+	case "resolved", "completed":
+		return true
+	}
+	return false
+}
+
 func buildStatusMessage() (string, error) {
-	statuses, err := crawlComponentStatuses()
+	incidents, err := fetchStatusFeed()
 	if err != nil {
 		return "", err
 	}
 
-	lines := []string{"最新のステータスだよ！", "", "【コンポーネント】"}
+	// 進行中（未解決）のインシデントを抽出
+	var ongoing []feedIncident
+	for _, inc := range incidents {
+		if !isResolvedStatus(inc.Status) {
+			ongoing = append(ongoing, inc)
+		}
+	}
 
-	for _, name := range targetComponents {
-		status := "unknown"
-		for compName, st := range statuses {
-			if strings.Contains(compName, name) {
-				status = st
-				break
+	lines := []string{"最新のステータスだよ！", ""}
+
+	if len(ongoing) == 0 {
+		lines = append(lines, "✅ 進行中のインシデントはないみたい！")
+		// 直近の解決済みインシデントを1件だけ参考表示
+		latest := incidents[0]
+		lines = append(lines, "", "【直近のインシデント】")
+		lines = append(lines, fmt.Sprintf("%s %s", feedStatusEmoji(latest.Status), latest.Title))
+		lines = append(lines, fmt.Sprintf("　- %s", latest.Status))
+	} else {
+		lines = append(lines, "【進行中のインシデント】")
+		for _, inc := range ongoing {
+			lines = append(lines, fmt.Sprintf("%s %s", feedStatusEmoji(inc.Status), inc.Title))
+			lines = append(lines, fmt.Sprintf("　- %s", inc.Status))
+			if inc.Link != "" {
+				lines = append(lines, fmt.Sprintf("　🖇️ %s", inc.Link))
 			}
 		}
-		lines = append(lines, fmt.Sprintf("%s %s - %s",
-			componentEmoji(status),
-			name,
-			strings.ReplaceAll(status, "_", " "),
-		))
 	}
 
 	return strings.Join(lines, "\n"), nil
