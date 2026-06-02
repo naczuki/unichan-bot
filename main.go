@@ -16,17 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"regexp"
-
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	_ "modernc.org/sqlite"
-)
-
-const (
-	incidentAPI   = "https://status.claude.com/api/v2/incidents.json"
-	statusFeedURL = "https://status.claude.com/history.atom"
-	browserUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 var postRelays = []string{
@@ -75,212 +67,52 @@ func publishEvent(ctx context.Context, ev nostr.Event) bool {
 	return atomic.LoadInt32(&successCount) > 0
 }
 
-// ── Status ─────────────────────────────────────────────
+// ── Status (Webhook由来の最新状態を保持) ────────────────
 
-type StatusSummary struct {
-	Components []struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	} `json:"components"`
-	Incidents []struct {
-		ID        string `json:"id"`
-		UpdatedAt string `json:"updated_at"`
-		Name      string `json:"name"`
-		Status    string `json:"status"`
-		Shortlink string `json:"shortlink"`
-		IncidentUpdates []struct {
-			ID   string `json:"id"`
-			Body string `json:"body"`
-		} `json:"incident_updates"`
-	} `json:"incidents"`
+// status.claude.com への直接アクセス（API/HTML/Atom）は Fly.io のデータセンターIPから
+// bot判定(405)で弾かれる。そのため、Webhookで受け取った最新のインシデント本文を
+// メモリに保持し、メンション応答でもそれを返す。
+type statusStore struct {
+	mu        sync.RWMutex
+	message   string    // 最後にWebhookで構築した本文
+	updatedAt time.Time // 最後に更新した時刻
 }
 
-type IncidentSummary struct {
-	Incidents []struct {
-		ID        string `json:"id"`
-		UpdatedAt string `json:"updated_at"`
-		Name      string `json:"name"`
-		Status    string `json:"status"`
-		Shortlink string `json:"shortlink"`
-		IncidentUpdates []struct {
-			ID   string `json:"id"`
-			Body string `json:"body"`
-		} `json:"incident_updates"`
-	} `json:"incidents"`
+var latestStatus = &statusStore{}
+
+func (s *statusStore) set(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.message = msg
+	s.updatedAt = time.Now()
 }
 
-func fetchIncidents() (*IncidentSummary, error) {
-	resp, err := http.Get(incidentAPI)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("incidents API returned %d: %s", resp.StatusCode, string(body))
-	}
-	var s IncidentSummary
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
-		return nil, err
-	}
-	return &s, nil
-}
-
-func incidentEmoji(status string) string {
-	switch status {
-	case "resolved":
-		return "✅"
-	case "investigating", "identified", "monitoring":
-		return "🟡"
-	default:
-		return "🔴"
-	}
-}
-
-// インシデントのステータス文字列に絵文字を付ける
-func feedStatusEmoji(status string) string {
-	switch strings.ToLower(status) {
-	case "resolved", "completed":
-		return "✅"
-	case "investigating", "identified", "monitoring", "update", "in progress", "scheduled", "verifying":
-		return "🟡"
-	default:
-		return "🔴"
-	}
-}
-
-type feedIncident struct {
-	Title   string
-	Status  string // 最新の更新状態 (Resolved/Investigating/...)
-	Updated string // ISO8601
-	Link    string
-}
-
-// status.claude.com の Atom フィードを取得して最新インシデントを返す。
-// API(summary.json)やトップページHTMLはデータセンターIPからbot判定(405)で弾かれるが、
-// Atomフィードは取得できるため、こちらを使う。
-func fetchStatusFeed() ([]feedIncident, error) {
-	req, err := http.NewRequest("GET", statusFeedURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Accept", "application/atom+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return nil, fmt.Errorf("status feed returned %d: %s", resp.StatusCode, string(body))
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	xmlText := string(body)
-	var incidents []feedIncident
-	for _, e := range entryRe.FindAllStringSubmatch(xmlText, -1) {
-		entry := e[1]
-		title := htmlUnescape(strings.TrimSpace(submatch(entryTitleRe, entry)))
-		updated := strings.TrimSpace(submatch(entryUpdatedRe, entry))
-		link := ""
-		if lm := entryLinkRe.FindStringSubmatch(entry); lm != nil {
-			link = lm[1]
-		}
-		// content内の最初の <strong>状態</strong> が最新の更新状態
-		status := "unknown"
-		if cm := entryContentRe.FindStringSubmatch(entry); cm != nil {
-			if sm := strongStateRe.FindStringSubmatch(cm[1]); sm != nil {
-				status = strings.TrimSpace(sm[1])
-			}
-		}
-		if title == "" {
-			continue
-		}
-		incidents = append(incidents, feedIncident{Title: title, Status: status, Updated: updated, Link: link})
-	}
-	if len(incidents) == 0 {
-		return nil, fmt.Errorf("no entries parsed from status feed")
-	}
-	return incidents, nil
-}
-
-func submatch(re *regexp.Regexp, s string) string {
-	if m := re.FindStringSubmatch(s); m != nil {
-		return m[1]
-	}
-	return ""
-}
-
-var (
-	entryRe         = regexp.MustCompile(`(?s)<entry>(.*?)</entry>`)
-	entryTitleRe    = regexp.MustCompile(`(?s)<title>(.*?)</title>`)
-	entryUpdatedRe  = regexp.MustCompile(`(?s)<updated>(.*?)</updated>`)
-	entryLinkRe     = regexp.MustCompile(`<link[^>]*href="([^"]+)"`)
-	entryContentRe  = regexp.MustCompile(`(?s)<content[^>]*>(.*?)</content>`)
-	strongStateRe   = regexp.MustCompile(`(?s)(?:&lt;|<)strong(?:&gt;|>)\s*(.*?)\s*(?:&lt;|<)/strong`)
-)
-
-func htmlUnescape(s string) string {
-	r := strings.NewReplacer(
-		"&amp;", "&",
-		"&#39;", "'",
-		"&quot;", `"`,
-		"&lt;", "<",
-		"&gt;", ">",
-	)
-	return r.Replace(s)
-}
-
-// 状態が解決済みかどうか
-func isResolvedStatus(s string) bool {
-	switch strings.ToLower(s) {
-	case "resolved", "completed":
-		return true
-	}
-	return false
+func (s *statusStore) get() (string, time.Time) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.message, s.updatedAt
 }
 
 func buildStatusMessage() (string, error) {
-	incidents, err := fetchStatusFeed()
-	if err != nil {
-		return "", err
+	msg, updatedAt := latestStatus.get()
+	if msg == "" {
+		return "まだステータスの更新を受け取ってないよ！\n何か動きがあったらお知らせするね！", nil
 	}
+	footer := fmt.Sprintf("\n\n（%s前に受け取った情報だよ）", humanizeDuration(time.Since(updatedAt)))
+	return msg + footer, nil
+}
 
-	// 進行中（未解決）のインシデントを抽出
-	var ongoing []feedIncident
-	for _, inc := range incidents {
-		if !isResolvedStatus(inc.Status) {
-			ongoing = append(ongoing, inc)
-		}
+func humanizeDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "さっき"
+	case d < time.Hour:
+		return fmt.Sprintf("%d分", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%d時間", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%d日", int(d.Hours()/24))
 	}
-
-	lines := []string{"最新のステータスだよ！", ""}
-
-	if len(ongoing) == 0 {
-		lines = append(lines, "✅ 進行中のインシデントはないみたい！")
-		// 直近の解決済みインシデントを1件だけ参考表示
-		latest := incidents[0]
-		lines = append(lines, "", "【直近のインシデント】")
-		lines = append(lines, fmt.Sprintf("%s %s", feedStatusEmoji(latest.Status), latest.Title))
-		lines = append(lines, fmt.Sprintf("　- %s", latest.Status))
-	} else {
-		lines = append(lines, "【進行中のインシデント】")
-		for _, inc := range ongoing {
-			lines = append(lines, fmt.Sprintf("%s %s", feedStatusEmoji(inc.Status), inc.Title))
-			lines = append(lines, fmt.Sprintf("　- %s", inc.Status))
-			if inc.Link != "" {
-				lines = append(lines, fmt.Sprintf("　🖇️ %s", inc.Link))
-			}
-		}
-	}
-
-	return strings.Join(lines, "\n"), nil
 }
 
 // ── Webhook投稿フォーマット ────────────────────────────
@@ -393,82 +225,6 @@ func (d *DB) recordPolled(key string) error {
 		log.Printf("⚠️ polled_incidents cleanup failed: %v", delErr)
 	}
 	return err
-}
-
-// ── インシデントポーリング ────────────────────────────
-
-func pollIncidents(ctx context.Context, db *DB, skHex string) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			checkIncidents(ctx, db, skHex)
-		}
-	}
-}
-
-func checkIncidents(ctx context.Context, db *DB, skHex string) {
-	s, err := fetchIncidents()
-	if err != nil {
-		log.Printf("❌ pollIncidents fetchIncidents: %v", err)
-		return
-	}
-
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-
-	for _, inc := range s.Incidents {
-		if len(inc.IncidentUpdates) == 0 {
-			continue
-		}
-		latestUpdate := inc.IncidentUpdates[0]
-		// 24時間以上前のインシデントはスキップ
-		updatedAt, err := time.Parse(time.RFC3339, inc.UpdatedAt)
-		if err != nil || updatedAt.Before(cutoff) {
-			continue
-		}
-		key := fmt.Sprintf("poll:%s:%s", inc.ID, latestUpdate.ID)
-		dup, err := db.isPolledDuplicate(key)
-		if err != nil {
-			log.Printf("❌ pollIncidents DB: %v", err)
-			continue
-		}
-		if dup {
-			continue
-		}
-
-		log.Printf("📋 New incident via polling: %s (%s)", inc.Name, inc.Status)
-
-		lines := []string{"ステータスが更新されたよ！", ""}
-		lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
-		lines = append(lines, formatStatus(inc.Status))
-		if latestUpdate.Body != "" {
-			lines = append(lines, "", fmt.Sprintf("💬 %s", latestUpdate.Body))
-		}
-		if inc.Shortlink != "" {
-			lines = append(lines, fmt.Sprintf("🔗 %s", inc.Shortlink))
-		}
-
-		content := strings.Join(lines, "\n")
-		ev := nostr.Event{
-			Kind:      nostr.KindTextNote,
-			CreatedAt: nostr.Timestamp(time.Now().Unix()),
-			Tags:      nostr.Tags{},
-			Content:   content,
-		}
-		if err := ev.Sign(skHex); err != nil {
-			log.Printf("❌ pollIncidents Sign: %v", err)
-			continue
-		}
-		if publishEvent(ctx, ev) {
-			db.recordPolled(key)
-		} else {
-			log.Printf("⚠️ All relays failed for %s, will retry next poll", inc.ID)
-		}
-	}
 }
 
 // ── メンション購読 ─────────────────────────────────────
@@ -636,6 +392,8 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 			if dedupKey != "" {
 				db.record(dedupKey)
 			}
+			// メンション応答用に最新状態を保持する
+			latestStatus.set(content)
 			fmt.Fprint(w, "Posted!")
 		} else {
 			log.Printf("⚠️ All relays failed for webhook")
