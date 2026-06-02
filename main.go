@@ -16,14 +16,18 @@ import (
 	"syscall"
 	"time"
 
+	"regexp"
+
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	statusAPI   = "https://status.claude.com/api/v2/summary.json"
-	incidentAPI = "https://status.claude.com/api/v2/incidents.json"
+	statusAPI     = "https://status.claude.com/api/v2/summary.json"
+	incidentAPI   = "https://status.claude.com/api/v2/incidents.json"
+	statusPageURL = "https://status.claude.com"
+	browserUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 var postRelays = []string{
@@ -130,23 +134,6 @@ func fetchIncidents() (*IncidentSummary, error) {
 	return &s, nil
 }
 
-func fetchStatus() (*StatusSummary, error) {
-	resp, err := http.Get(statusAPI)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("status API returned %d: %s", resp.StatusCode, string(body))
-	}
-	var s StatusSummary
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
-		return nil, err
-	}
-	return &s, nil
-}
-
 func componentEmoji(status string) string {
 	switch status {
 	case "operational":
@@ -169,8 +156,91 @@ func incidentEmoji(status string) string {
 	}
 }
 
+// statuspageのstatus-colorクラスを内部ステータス文字列に変換する
+func colorToStatus(color string) string {
+	switch color {
+	case "green":
+		return "operational"
+	case "yellow", "blue":
+		return "degraded_performance"
+	case "orange":
+		return "partial_outage"
+	case "red":
+		return "major_outage"
+	default:
+		return "unknown"
+	}
+}
+
+// ステータスページのHTMLをブラウザUAでクロールし、
+// コンポーネント名 → ステータスのマップを返す。
+// botのUAだとAPI(summary.json)が弾かれるため、HTMLページを直接パースする。
+func crawlComponentStatuses() (map[string]string, error) {
+	req, err := http.NewRequest("GET", statusPageURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "ja,en;q=0.9")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("status page returned %d: %s", resp.StatusCode, string(body))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	html := string(body)
+	result := map[string]string{}
+	// 各コンポーネントブロック: class="component-inner-container status-<color> ..."
+	// その中の class="name ...">NAME< を対応づける
+	matches := componentBlockRe.FindAllStringSubmatch(html, -1)
+	for _, m := range matches {
+		color := m[1]
+		inner := m[2]
+		nm := componentNameRe.FindStringSubmatch(inner)
+		if nm == nil {
+			continue
+		}
+		name := htmlUnescape(strings.TrimSpace(nm[1]))
+		if name == "" {
+			continue
+		}
+		result[name] = colorToStatus(color)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no components parsed from status page")
+	}
+	return result, nil
+}
+
+var (
+	componentBlockRe = regexp.MustCompile(`(?s)component-inner-container status-(\w+)[^>]*>(.*?)</div>\s*</div>`)
+	componentNameRe  = regexp.MustCompile(`(?s)class="name[^"]*"[^>]*>\s*([^<]+?)\s*<`)
+)
+
+func htmlUnescape(s string) string {
+	r := strings.NewReplacer(
+		"&amp;", "&",
+		"&#39;", "'",
+		"&quot;", `"`,
+		"&lt;", "<",
+		"&gt;", ">",
+	)
+	return r.Replace(s)
+}
+
 func buildStatusMessage() (string, error) {
-	s, err := fetchStatus()
+	statuses, err := crawlComponentStatuses()
 	if err != nil {
 		return "", err
 	}
@@ -179,9 +249,9 @@ func buildStatusMessage() (string, error) {
 
 	for _, name := range targetComponents {
 		status := "unknown"
-		for _, c := range s.Components {
-			if strings.Contains(c.Name, name) {
-				status = c.Status
+		for compName, st := range statuses {
+			if strings.Contains(compName, name) {
+				status = st
 				break
 			}
 		}
@@ -190,17 +260,6 @@ func buildStatusMessage() (string, error) {
 			name,
 			strings.ReplaceAll(status, "_", " "),
 		))
-	}
-
-	if len(s.Incidents) > 0 {
-		lines = append(lines, "", "【インシデント】")
-		for _, inc := range s.Incidents {
-			lines = append(lines, fmt.Sprintf("%s %s", incidentEmoji(inc.Status), inc.Name))
-			lines = append(lines, fmt.Sprintf("　- %s", strings.ToUpper(inc.Status[:1])+inc.Status[1:]))
-			if inc.Shortlink != "" {
-				lines = append(lines, fmt.Sprintf("　🖇️ %s", inc.Shortlink))
-			}
-		}
 	}
 
 	return strings.Join(lines, "\n"), nil
