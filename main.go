@@ -330,8 +330,8 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 			return
 		}
 
-		if payload.ComponentUpdate != nil {
-			fmt.Fprint(w, "Ignored (component_update)")
+		if payload.ComponentUpdate != nil && payload.Incident == nil {
+			fmt.Fprint(w, "Ignored (component_update only)")
 			return
 		}
 
