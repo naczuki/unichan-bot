@@ -21,11 +21,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Fly の外向きIPは US 扱いになることがあり、US を拒否するリレー（例: yabu.me の
+// "Country US not allowed"）には接続できない。そのため US ジオブロックのない
+// リレーを並べる。
 var postRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
-	"wss://yabu.me",
+	"wss://relay.damus.io",
 }
 
 // ── Nostr ──────────────────────────────────────────────
@@ -480,7 +483,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			Since: &since,
 		}}
 
-		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp", "wss://yabu.me"}
+		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp", "wss://relay-jp.nostr.wirednet.jp", "wss://relay.damus.io"}
 		events := pool.SubMany(subCtx, subRelays, filters)
 		log.Printf("📡 Subscribed to mentions for %s", myPubkey)
 
