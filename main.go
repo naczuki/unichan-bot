@@ -67,52 +67,93 @@ func publishEvent(ctx context.Context, ev nostr.Event) bool {
 	return atomic.LoadInt32(&successCount) > 0
 }
 
-// ── Status (直近のインシデント本文をメモリ保持) ─────────
+// ── Status (進行中インシデントのスナップショットを保持) ──
 
-// メンション（「ステータス」等）への応答用に、webhook/poll で最後に投稿した
-// インシデント本文をメモリに保持する。応答のたびに status.claude.com を
-// 叩き直さずに済むようにするためのキャッシュ。
-type statusStore struct {
+// incidentSnapshot は poll が取得した最新のインシデント一覧をメモリに保持する。
+// メンション（「ステータス」等）への応答は、毎回 status.claude.com を叩かず
+// このスナップショットから「現在進行中の障害」を組み立てる。
+type incidentSnapshot struct {
 	mu        sync.RWMutex
-	message   string    // 最後にWebhookで構築した本文
-	updatedAt time.Time // 最後に更新した時刻
+	incidents []incidentPayload
+	updatedAt time.Time
+	primed    bool // 一度でも取得に成功したか
 }
 
-var latestStatus = &statusStore{}
+var incidentList = &incidentSnapshot{}
 
-func (s *statusStore) set(msg string) {
+func (s *incidentSnapshot) set(list []incidentPayload) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.message = msg
+	s.incidents = list
 	s.updatedAt = time.Now()
+	s.primed = true
 }
 
-func (s *statusStore) get() (string, time.Time) {
+func (s *incidentSnapshot) get() ([]incidentPayload, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.message, s.updatedAt
+	return s.incidents, s.primed
 }
 
-func buildStatusMessage() (string, error) {
-	msg, updatedAt := latestStatus.get()
-	if msg == "" {
-		return "まだステータスの更新を受け取ってないよ！\n何か動きがあったらお知らせするね！", nil
-	}
-	footer := fmt.Sprintf("\n\n（%s前に受け取った情報だよ）", humanizeDuration(time.Since(updatedAt)))
-	return msg + footer, nil
+// ongoingStatuses は「対応中」とみなすインシデントステータス。
+var ongoingStatuses = map[string]bool{
+	"investigating": true,
+	"identified":    true,
+	"monitoring":    true,
 }
 
-func humanizeDuration(d time.Duration) string {
-	switch {
-	case d < time.Minute:
-		return "さっき"
-	case d < time.Hour:
-		return fmt.Sprintf("%d分", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%d時間", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%d日", int(d.Hours()/24))
+// buildStatusMessage は現在進行中の障害を時刻付きの一覧で返す。
+// 進行中の障害がなければ「いま対応中の障害はないよ」を返す。
+func buildStatusMessage() string {
+	incs, primed := incidentList.get()
+	if !primed {
+		return "まだステータスを確認できてないよ！\nちょっと待ってね！"
 	}
+	var lines []string
+	for _, inc := range incs {
+		if !ongoingStatuses[inc.Status] {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("📡 %s", inc.Name))
+		lines = append(lines, fmt.Sprintf("　🕐 %s（%s）", incidentTimeJST(inc), inc.Status))
+	}
+	if len(lines) == 0 {
+		return "いま対応中の障害はないよ"
+	}
+	return "いま対応中の障害だよ！\n\n" + strings.Join(lines, "\n")
+}
+
+// incidentTimeJST はインシデントの発生時刻を JST の "M/D HH:MM" で返す。
+// started_at → created_at → updated_at の順に利用できるものを使う。
+func incidentTimeJST(inc incidentPayload) string {
+	for _, iso := range []string{inc.StartedAt, inc.CreatedAt, inc.UpdatedAt} {
+		if iso == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, iso); err == nil {
+			return t.In(time.FixedZone("JST", 9*3600)).Format("1/2 15:04")
+		}
+	}
+	return "時刻不明"
+}
+
+// notifyOwner はオーナー宛に kind:1 ノート（p タグ付き）を投稿して通知する。
+// ステータス取得エラー／復旧の連絡に使う。ownerPubkey が空なら何もしない。
+func notifyOwner(ctx context.Context, skHex, ownerPubkey, msg string) {
+	if ownerPubkey == "" {
+		return
+	}
+	ev := nostr.Event{
+		Kind:      nostr.KindTextNote,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      nostr.Tags{{"p", ownerPubkey}},
+		Content:   msg,
+	}
+	if err := ev.Sign(skHex); err != nil {
+		log.Printf("❌ notifyOwner sign failed: %v", err)
+		return
+	}
+	publishEvent(ctx, ev)
 }
 
 // ── Webhook投稿フォーマット ────────────────────────────
@@ -204,7 +245,7 @@ const (
 	postDuplicate                   // 既に処理済みで投稿しなかった
 )
 
-// postIncident は重複チェック→Nostr投稿→latestStatus更新を一括で行う。
+// postIncident は重複チェック→Nostr投稿を一括で行う。
 //
 // webhook と poll は併走するため、投稿の「前」に db.claim でキーを原子的に確保し、
 // 確保できた経路だけが投稿する。これにより同じインシデント更新が両経路から
@@ -234,7 +275,6 @@ func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, sourc
 		return postFailed
 	}
 	if publishEvent(ctx, ev) {
-		latestStatus.set(content)
 		log.Printf("✅ Posted incident via %s: %s (%s)", source, inc.Name, inc.Status)
 		return postPosted
 	}
@@ -253,7 +293,9 @@ type incidentPayload struct {
 	ID              string          `json:"id"`
 	Name            string          `json:"name"`
 	Status          string          `json:"status"`
+	CreatedAt       string          `json:"created_at"`
 	UpdatedAt       string          `json:"updated_at"`
+	StartedAt       string          `json:"started_at"`
 	Shortlink       string          `json:"shortlink"`
 	Components      []ComponentItem `json:"components"`
 	IncidentUpdates []struct {
@@ -303,7 +345,7 @@ func fetchIncidents(ctx context.Context, client *http.Client) (*incidentsRespons
 	return &parsed, nil
 }
 
-func pollIncidents(ctx context.Context, db *DB, skHex string) {
+func pollIncidents(ctx context.Context, db *DB, skHex, ownerPubkey string) {
 	const interval = 90 * time.Second
 	client := &http.Client{Timeout: 15 * time.Second}
 	ticker := time.NewTicker(interval)
@@ -312,6 +354,10 @@ func pollIncidents(ctx context.Context, db *DB, skHex string) {
 	// 起動直後の既存インシデントは「既読」として記録だけして投稿しない
 	// （再起動のたびに過去インシデントを蒸し返さないため）。
 	primeSeen(ctx, db, client)
+
+	// failing: 直近の取得が失敗状態か。健全↔失敗の遷移時にだけオーナーへ通知する
+	// （失敗が続いても通知は最初の一回、復旧時にも一回だけ）。
+	failing := false
 
 	log.Printf("🔁 Incident polling started (interval=%s)", interval)
 	for {
@@ -322,8 +368,18 @@ func pollIncidents(ctx context.Context, db *DB, skHex string) {
 			data, err := fetchIncidents(ctx, client)
 			if err != nil {
 				log.Printf("⚠️ poll fetch failed: %v", err)
+				if !failing {
+					notifyOwner(ctx, skHex, ownerPubkey,
+						fmt.Sprintf("⚠️ ステータスの取得に失敗してるみたい…\nエラー: %v\n\n直ったらまた知らせるね！", err))
+					failing = true
+				}
 				continue
 			}
+			if failing {
+				notifyOwner(ctx, skHex, ownerPubkey, "✅ ステータスの取得が復活したよ！")
+				failing = false
+			}
+			incidentList.set(data.Incidents)
 			for _, raw := range data.Incidents {
 				postIncident(ctx, db, skHex, raw.toIncident(), "poll")
 			}
@@ -338,6 +394,7 @@ func primeSeen(ctx context.Context, db *DB, client *http.Client) {
 		log.Printf("⚠️ primeSeen fetch failed (起動時の既読登録をスキップ): %v", err)
 		return
 	}
+	incidentList.set(data.Incidents)
 	n := 0
 	for _, raw := range data.Incidents {
 		if claimed, _ := db.claim(raw.toIncident().dedupKey()); claimed {
@@ -433,12 +490,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			go func(ev *nostr.Event, lower string) {
 				var msg string
 				if strings.Contains(lower, "ステータス") || strings.Contains(lower, "status") {
-					var err error
-					msg, err = buildStatusMessage()
-					if err != nil {
-						log.Printf("❌ buildStatusMessage: %v", err)
-						return
-					}
+					msg = buildStatusMessage()
 				} else {
 					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "「ステータス」っていってみて！", "Claudeを崇めよ"}
 					msg = cries[time.Now().UnixNano()%int64(len(cries))]
@@ -538,7 +590,6 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 				return
 			}
 			if publishEvent(ctx, ev) {
-				latestStatus.set(content)
 				fmt.Fprint(w, "Posted!")
 			} else {
 				log.Printf("⚠️ All relays failed for webhook")
@@ -553,6 +604,30 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 
 // ── main ───────────────────────────────────────────────
 
+// defaultOwnerNpub はステータス取得エラー／復旧の通知先（オーナー）。
+// 環境変数 OWNER_NPUB で上書きできる。
+const defaultOwnerNpub = "npub1s2es6vzyg9cwd2xgr85yqm3k9gmf2322gctcjn8zwphnssxxcqpsw829jv"
+
+// ownerPubkeyHex は通知先 npub を hex pubkey に変換する。
+// 不正な値なら空文字を返し、通知を無効化する（bot 自体は止めない）。
+func ownerPubkeyHex() string {
+	npub := os.Getenv("OWNER_NPUB")
+	if npub == "" {
+		npub = defaultOwnerNpub
+	}
+	_, data, err := nip19.Decode(strings.TrimSpace(npub))
+	if err != nil {
+		log.Printf("⚠️ OWNER_NPUB decode失敗、オーナー通知を無効化: %v", err)
+		return ""
+	}
+	hex, ok := data.(string)
+	if !ok {
+		log.Printf("⚠️ OWNER_NPUB 想定外の型 %T、オーナー通知を無効化", data)
+		return ""
+	}
+	return hex
+}
+
 func main() {
 	nsec := os.Getenv("MY_NSEC")
 	if nsec == "" {
@@ -565,6 +640,11 @@ func main() {
 		log.Fatalf("Failed to get pubkey: %v", err)
 	}
 	log.Printf("My pubkey: %s", pubkey)
+
+	ownerPubkey := ownerPubkeyHex()
+	if ownerPubkey != "" {
+		log.Printf("Owner pubkey (通知先): %s", ownerPubkey)
+	}
 
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
@@ -581,7 +661,7 @@ func main() {
 	go subscribeMentions(ctx, skHex, pubkey)
 
 	// インシデントポーリング（webhookと併用。webhookの遅延をポーリングで補う）
-	go pollIncidents(ctx, db, skHex)
+	go pollIncidents(ctx, db, skHex, ownerPubkey)
 
 	port := os.Getenv("PORT")
 	if port == "" {
