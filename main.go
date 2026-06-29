@@ -160,6 +160,171 @@ func formatComponents(components []ComponentItem) string {
 	return strings.Join(chunks, "\n\u3000\u3000")
 }
 
+// ── インシデント整形（webhook/poll共通）─────────────────
+
+// Incident は incidents.json / webhook の両方から組み立てる共通の中間表現。
+type Incident struct {
+	ID         string
+	UpdatedAt  string
+	Name       string
+	Status     string
+	Shortlink  string
+	Components []ComponentItem
+	LatestBody string
+}
+
+func (inc Incident) dedupKey() string {
+	return fmt.Sprintf("%s:%s", inc.ID, inc.UpdatedAt)
+}
+
+// formatIncidentLines は Nostr 投稿本文を組み立てる。webhookとpollで共通利用。
+func formatIncidentLines(inc Incident) string {
+	var lines []string
+	lines = append(lines, "ステータスが更新されたよ！", "")
+	lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
+	lines = append(lines, formatStatus(inc.Status))
+	if inc.LatestBody != "" {
+		lines = append(lines, "", fmt.Sprintf("💬 %s", inc.LatestBody))
+	}
+	if cs := formatComponents(inc.Components); cs != "" {
+		lines = append(lines, fmt.Sprintf("🖇️ %s", cs))
+	}
+	if inc.Shortlink != "" {
+		lines = append(lines, fmt.Sprintf("🔗 %s", inc.Shortlink))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// postIncident は重複チェック→Nostr投稿→記録→latestStatus更新を一括で行う。
+// 投稿したら true、重複や失敗で投稿しなかったら false を返す。
+func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, source string) bool {
+	key := inc.dedupKey()
+	dup, err := db.seen(key)
+	if err != nil {
+		log.Printf("❌ DB error (%s): %v", source, err)
+	}
+	if dup {
+		return false
+	}
+	content := formatIncidentLines(inc)
+	ev := nostr.Event{
+		Kind:      nostr.KindTextNote,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      nostr.Tags{},
+		Content:   content,
+	}
+	if err := ev.Sign(skHex); err != nil {
+		log.Printf("❌ Sign failed (%s): %v", source, err)
+		return false
+	}
+	if publishEvent(ctx, ev) {
+		db.markSeen(key)
+		latestStatus.set(content)
+		log.Printf("✅ Posted incident via %s: %s (%s)", source, inc.Name, inc.Status)
+		return true
+	}
+	log.Printf("⚠️ All relays failed (%s)", source)
+	return false
+}
+
+// ── インシデントポーリング ─────────────────────────────
+
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+type incidentsResponse struct {
+	Incidents []struct {
+		ID              string          `json:"id"`
+		Name            string          `json:"name"`
+		Status          string          `json:"status"`
+		UpdatedAt       string          `json:"updated_at"`
+		Shortlink       string          `json:"shortlink"`
+		Components      []ComponentItem `json:"components"`
+		IncidentUpdates []struct {
+			Body string `json:"body"`
+		} `json:"incident_updates"`
+	} `json:"incidents"`
+}
+
+func fetchIncidents(ctx context.Context, client *http.Client) (*incidentsResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://status.claude.com/api/v2/incidents.json", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var parsed incidentsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func pollIncidents(ctx context.Context, db *DB, skHex string) {
+	const interval = 90 * time.Second
+	client := &http.Client{Timeout: 15 * time.Second}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// 起動直後の既存インシデントは「既読」として記録だけして投稿しない
+	// （再起動のたびに過去インシデントを蒸し返さないため）。
+	primeSeen(ctx, db, client)
+
+	log.Printf("🔁 Incident polling started (interval=%s)", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			data, err := fetchIncidents(ctx, client)
+			if err != nil {
+				log.Printf("⚠️ poll fetch failed: %v", err)
+				continue
+			}
+			for _, raw := range data.Incidents {
+				inc := Incident{
+					ID:         raw.ID,
+					UpdatedAt:  raw.UpdatedAt,
+					Name:       raw.Name,
+					Status:     raw.Status,
+					Shortlink:  raw.Shortlink,
+					Components: raw.Components,
+				}
+				if len(raw.IncidentUpdates) > 0 {
+					inc.LatestBody = raw.IncidentUpdates[0].Body
+				}
+				postIncident(ctx, db, skHex, inc, "poll")
+			}
+		}
+	}
+}
+
+// primeSeen は起動時に現在のインシデント群を既読として記録するだけ（投稿しない）。
+func primeSeen(ctx context.Context, db *DB, client *http.Client) {
+	data, err := fetchIncidents(ctx, client)
+	if err != nil {
+		log.Printf("⚠️ primeSeen fetch failed (起動時の既読登録をスキップ): %v", err)
+		return
+	}
+	n := 0
+	for _, raw := range data.Incidents {
+		key := fmt.Sprintf("%s:%s", raw.ID, raw.UpdatedAt)
+		if seen, _ := db.seen(key); !seen {
+			db.markSeen(key)
+			n++
+		}
+	}
+	log.Printf("🔖 primeSeen: %d 件の既存インシデントを既読登録", n)
+}
+
 // ── SQLite 重複チェック ────────────────────────────────
 
 type DB struct {
@@ -199,11 +364,21 @@ func (d *DB) isDuplicate(key string) (bool, error) {
 	return count > 0, err
 }
 
+// seen / markSeen は webhook とポーリングで共通のキー空間（webhook_logs）を使い、
+// 同じインシデント更新が両経路から二重投稿されるのを防ぐ。
+func (d *DB) seen(key string) (bool, error) {
+	return d.isDuplicate(key)
+}
+
+func (d *DB) markSeen(key string) error {
+	return d.record(key)
+}
+
 func (d *DB) record(key string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	_, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
-	if _, delErr := d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 100)`); delErr != nil {
+	if _, delErr := d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 300)`); delErr != nil {
 		log.Printf("⚠️ webhook_logs cleanup failed: %v", delErr)
 	}
 	return err
@@ -330,75 +505,67 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 			return
 		}
 
-		if payload.ComponentUpdate != nil && payload.Incident == nil {
-			fmt.Fprint(w, "Ignored (component_update only)")
+		if payload.ComponentUpdate != nil {
+			fmt.Fprint(w, "Ignored (component_update)")
 			return
 		}
 
-		var lines []string
-		var dedupKey string
-
 		if payload.Incident != nil {
-			inc := payload.Incident
-			dedupKey = fmt.Sprintf("%s:%s", inc.ID, inc.UpdatedAt)
-			dup, err := db.isDuplicate(dedupKey)
-			if err != nil {
-				log.Printf("❌ DB error: %v", err)
+			raw := payload.Incident
+			inc := Incident{
+				ID:         raw.ID,
+				UpdatedAt:  raw.UpdatedAt,
+				Name:       raw.Name,
+				Status:     raw.Status,
+				Shortlink:  raw.Shortlink,
+				Components: raw.Components,
 			}
-			if dup {
+			if len(raw.IncidentUpdates) > 0 {
+				inc.LatestBody = raw.IncidentUpdates[0].Body
+			}
+			if dup, _ := db.seen(inc.dedupKey()); dup {
 				fmt.Fprint(w, "Ignored (duplicate)")
 				return
 			}
-
 			log.Printf("📋 Webhook incident: %s (%s)", inc.Name, inc.Status)
+			if postIncident(ctx, db, skHex, inc, "webhook") {
+				fmt.Fprint(w, "Posted!")
+			} else {
+				http.Error(w, "publish failed", http.StatusInternalServerError)
+			}
+			return
+		}
 
-			lines = append(lines, "ステータスが更新されたよ！", "")
-			lines = append(lines, fmt.Sprintf("📡 %s", inc.Name), "")
-			lines = append(lines, formatStatus(inc.Status))
-			if len(inc.IncidentUpdates) > 0 {
-				lines = append(lines, "", fmt.Sprintf("💬 %s", inc.IncidentUpdates[0].Body))
-			}
-			if cs := formatComponents(inc.Components); cs != "" {
-				lines = append(lines, fmt.Sprintf("🖇️ %s", cs))
-			}
-			if inc.Shortlink != "" {
-				lines = append(lines, fmt.Sprintf("🔗 %s", inc.Shortlink))
-			}
-		} else if payload.Page != nil {
+		if payload.Page != nil {
+			var lines []string
 			lines = append(lines, "ステータスが更新されたよ！", "")
 			lines = append(lines, formatStatus(payload.Page.StatusIndicator))
 			if payload.Page.StatusDescription != "" {
 				lines = append(lines, "", fmt.Sprintf("💬 %s", payload.Page.StatusDescription))
 			}
-		} else {
-			fmt.Fprint(w, "Ignored (unknown payload)")
-			return
-		}
-
-		content := strings.Join(lines, "\n")
-		ev := nostr.Event{
-			Kind:      nostr.KindTextNote,
-			CreatedAt: nostr.Timestamp(time.Now().Unix()),
-			Tags:      nostr.Tags{},
-			Content:   content,
-		}
-		if err := ev.Sign(skHex); err != nil {
-			log.Printf("❌ Sign failed: %v", err)
-			http.Error(w, "sign error", http.StatusInternalServerError)
-			return
-		}
-
-		if publishEvent(ctx, ev) {
-			if dedupKey != "" {
-				db.record(dedupKey)
+			content := strings.Join(lines, "\n")
+			ev := nostr.Event{
+				Kind:      nostr.KindTextNote,
+				CreatedAt: nostr.Timestamp(time.Now().Unix()),
+				Tags:      nostr.Tags{},
+				Content:   content,
 			}
-			// メンション応答用に最新状態を保持する
-			latestStatus.set(content)
-			fmt.Fprint(w, "Posted!")
-		} else {
-			log.Printf("⚠️ All relays failed for webhook")
-			http.Error(w, "publish failed", http.StatusInternalServerError)
+			if err := ev.Sign(skHex); err != nil {
+				log.Printf("❌ Sign failed: %v", err)
+				http.Error(w, "sign error", http.StatusInternalServerError)
+				return
+			}
+			if publishEvent(ctx, ev) {
+				latestStatus.set(content)
+				fmt.Fprint(w, "Posted!")
+			} else {
+				log.Printf("⚠️ All relays failed for webhook")
+				http.Error(w, "publish failed", http.StatusInternalServerError)
+			}
+			return
 		}
+
+		fmt.Fprint(w, "Ignored (unknown payload)")
 	}
 }
 
@@ -431,8 +598,8 @@ func main() {
 
 	go subscribeMentions(ctx, skHex, pubkey)
 
-	// インシデントポーリング（現在CAPTCHA保護により無効化、Webhook併用中）
-	// go pollIncidents(ctx, db, skHex)
+	// インシデントポーリング（webhookと併用。webhookの遅延をポーリングで補う）
+	go pollIncidents(ctx, db, skHex)
 
 	port := os.Getenv("PORT")
 	if port == "" {
