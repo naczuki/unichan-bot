@@ -195,23 +195,31 @@ func formatIncidentLines(inc Incident) string {
 	return strings.Join(lines, "\n")
 }
 
+// postResult は postIncident の結果を表す（webhook の応答コード分岐に使う）。
+type postResult int
+
+const (
+	postFailed    postResult = iota // 投稿失敗 or DBエラー（リトライ可）
+	postPosted                      // 新規に投稿した
+	postDuplicate                   // 既に処理済みで投稿しなかった
+)
+
 // postIncident は重複チェック→Nostr投稿→latestStatus更新を一括で行う。
-// 投稿したら true、重複や失敗で投稿しなかったら false を返す。
 //
 // webhook と poll は併走するため、投稿の「前」に db.claim でキーを原子的に確保し、
 // 確保できた経路だけが投稿する。これにより同じインシデント更新が両経路から
 // 二重投稿されるレースを防ぐ。投稿に失敗した場合は unclaim でキーを戻し、
 // 次回（webhook再送やポーリング）でリトライできるようにする。
-func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, source string) bool {
+func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, source string) postResult {
 	key := inc.dedupKey()
 	claimed, err := db.claim(key)
 	if err != nil {
 		// DBエラー時は安全側に倒して投稿しない（誤った二重投稿を避ける）。
 		log.Printf("❌ DB error (%s): %v", source, err)
-		return false
+		return postFailed
 	}
 	if !claimed {
-		return false // 既に他経路が処理済み（重複）
+		return postDuplicate // 既に他経路が処理済み（重複）
 	}
 	content := formatIncidentLines(inc)
 	ev := nostr.Event{
@@ -223,34 +231,53 @@ func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, sourc
 	if err := ev.Sign(skHex); err != nil {
 		log.Printf("❌ Sign failed (%s): %v", source, err)
 		db.unclaim(key)
-		return false
+		return postFailed
 	}
 	if publishEvent(ctx, ev) {
 		latestStatus.set(content)
 		log.Printf("✅ Posted incident via %s: %s (%s)", source, inc.Name, inc.Status)
-		return true
+		return postPosted
 	}
 	log.Printf("⚠️ All relays failed (%s)", source)
 	db.unclaim(key)
-	return false
+	return postFailed
 }
 
 // ── インシデントポーリング ─────────────────────────────
 
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+// incidentPayload は incidents.json と webhook の incident オブジェクトに共通の
+// JSON 形。両経路でこの型をパースし、toIncident で投稿用の Incident に変換する。
+type incidentPayload struct {
+	ID              string          `json:"id"`
+	Name            string          `json:"name"`
+	Status          string          `json:"status"`
+	UpdatedAt       string          `json:"updated_at"`
+	Shortlink       string          `json:"shortlink"`
+	Components      []ComponentItem `json:"components"`
+	IncidentUpdates []struct {
+		Body string `json:"body"`
+	} `json:"incident_updates"`
+}
+
+func (p incidentPayload) toIncident() Incident {
+	inc := Incident{
+		ID:         p.ID,
+		UpdatedAt:  p.UpdatedAt,
+		Name:       p.Name,
+		Status:     p.Status,
+		Shortlink:  p.Shortlink,
+		Components: p.Components,
+	}
+	if len(p.IncidentUpdates) > 0 {
+		inc.LatestBody = p.IncidentUpdates[0].Body
+	}
+	return inc
+}
+
 type incidentsResponse struct {
-	Incidents []struct {
-		ID              string          `json:"id"`
-		Name            string          `json:"name"`
-		Status          string          `json:"status"`
-		UpdatedAt       string          `json:"updated_at"`
-		Shortlink       string          `json:"shortlink"`
-		Components      []ComponentItem `json:"components"`
-		IncidentUpdates []struct {
-			Body string `json:"body"`
-		} `json:"incident_updates"`
-	} `json:"incidents"`
+	Incidents []incidentPayload `json:"incidents"`
 }
 
 func fetchIncidents(ctx context.Context, client *http.Client) (*incidentsResponse, error) {
@@ -298,18 +325,7 @@ func pollIncidents(ctx context.Context, db *DB, skHex string) {
 				continue
 			}
 			for _, raw := range data.Incidents {
-				inc := Incident{
-					ID:         raw.ID,
-					UpdatedAt:  raw.UpdatedAt,
-					Name:       raw.Name,
-					Status:     raw.Status,
-					Shortlink:  raw.Shortlink,
-					Components: raw.Components,
-				}
-				if len(raw.IncidentUpdates) > 0 {
-					inc.LatestBody = raw.IncidentUpdates[0].Body
-				}
-				postIncident(ctx, db, skHex, inc, "poll")
+				postIncident(ctx, db, skHex, raw.toIncident(), "poll")
 			}
 		}
 	}
@@ -324,8 +340,7 @@ func primeSeen(ctx context.Context, db *DB, client *http.Client) {
 	}
 	n := 0
 	for _, raw := range data.Incidents {
-		key := fmt.Sprintf("%s:%s", raw.ID, raw.UpdatedAt)
-		if claimed, _ := db.claim(key); claimed {
+		if claimed, _ := db.claim(raw.toIncident().dedupKey()); claimed {
 			n++
 		}
 	}
@@ -353,20 +368,6 @@ func newDB(path string) (*DB, error) {
 		return nil, err
 	}
 	return &DB{db: db}, nil
-}
-
-func (d *DB) isDuplicate(key string) (bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM webhook_logs WHERE incident_key = ?`, key).Scan(&count)
-	return count > 0, err
-}
-
-// seen は key が既に記録済みか確認するだけ（登録はしない）。
-// webhook ハンドラの早期重複応答など、副作用なしで判定したい箇所で使う。
-func (d *DB) seen(key string) (bool, error) {
-	return d.isDuplicate(key)
 }
 
 // claim は key を webhook_logs に登録し、今回新規に登録できたら true を返す。
@@ -410,7 +411,10 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 		}
 
 		log.Printf("📡 Subscribing to mentions via SimplePool...")
-		pool := nostr.NewSimplePool(ctx)
+		// 接続ごとに子コンテキストを作り、再接続前に cancel して
+		// このpoolが張ったリレー接続を確実に閉じる（張りっぱなしのリーク防止）。
+		subCtx, cancel := context.WithCancel(ctx)
+		pool := nostr.NewSimplePool(subCtx)
 		since := nostr.Timestamp(time.Now().Unix())
 		filters := []nostr.Filter{{
 			Kinds: []int{nostr.KindTextNote},
@@ -419,7 +423,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 		}}
 
 		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp", "wss://yabu.me"}
-		events := pool.SubMany(ctx, subRelays, filters)
+		events := pool.SubMany(subCtx, subRelays, filters)
 		log.Printf("📡 Subscribed to mentions for %s", myPubkey)
 
 		for ie := range events {
@@ -456,6 +460,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			}(ev, lower)
 		}
 
+		cancel() // このpoolのリレー接続を閉じてから張り直す
 		log.Printf("⚠️ SubMany ended, reconnecting in 5s")
 		time.Sleep(5 * time.Second)
 	}
@@ -464,19 +469,9 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 // ── Webhook HTTPサーバー ───────────────────────────────
 
 type WebhookPayload struct {
-	ComponentUpdate *struct{} `json:"component_update"`
-	Incident        *struct {
-		ID              string          `json:"id"`
-		UpdatedAt       string          `json:"updated_at"`
-		Name            string          `json:"name"`
-		Status          string          `json:"status"`
-		Shortlink       string          `json:"shortlink"`
-		Components      []ComponentItem `json:"components"`
-		IncidentUpdates []struct {
-			Body string `json:"body"`
-		} `json:"incident_updates"`
-	} `json:"incident"`
-	Page *struct {
+	ComponentUpdate *struct{}        `json:"component_update"`
+	Incident        *incidentPayload `json:"incident"`
+	Page            *struct {
 		StatusIndicator   string `json:"status_indicator"`
 		StatusDescription string `json:"status_description"`
 	} `json:"page"`
@@ -510,26 +505,14 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 		}
 
 		if payload.Incident != nil {
-			raw := payload.Incident
-			inc := Incident{
-				ID:         raw.ID,
-				UpdatedAt:  raw.UpdatedAt,
-				Name:       raw.Name,
-				Status:     raw.Status,
-				Shortlink:  raw.Shortlink,
-				Components: raw.Components,
-			}
-			if len(raw.IncidentUpdates) > 0 {
-				inc.LatestBody = raw.IncidentUpdates[0].Body
-			}
-			if dup, _ := db.seen(inc.dedupKey()); dup {
-				fmt.Fprint(w, "Ignored (duplicate)")
-				return
-			}
+			inc := payload.Incident.toIncident()
 			log.Printf("📋 Webhook incident: %s (%s)", inc.Name, inc.Status)
-			if postIncident(ctx, db, skHex, inc, "webhook") {
+			switch postIncident(ctx, db, skHex, inc, "webhook") {
+			case postPosted:
 				fmt.Fprint(w, "Posted!")
-			} else {
+			case postDuplicate:
+				fmt.Fprint(w, "Ignored (duplicate)")
+			default:
 				http.Error(w, "publish failed", http.StatusInternalServerError)
 			}
 			return
