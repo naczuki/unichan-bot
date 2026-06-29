@@ -25,6 +25,7 @@ var postRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
+	"wss://yabu.me",
 }
 
 // ── Nostr ──────────────────────────────────────────────
@@ -123,15 +124,15 @@ func buildStatusMessage() string {
 	return "いま対応中の障害だよ！\n\n" + strings.Join(lines, "\n")
 }
 
-// incidentTimeJST はインシデントの発生時刻を JST の "M/D HH:MM" で返す。
-// started_at → created_at → updated_at の順に利用できるものを使う。
+// incidentTimeJST はインシデントの最終更新時刻を JST の "M/D HH:MM JST" で返す。
+// updated_at → created_at → started_at の順に利用できるものを使う。
 func incidentTimeJST(inc incidentPayload) string {
-	for _, iso := range []string{inc.StartedAt, inc.CreatedAt, inc.UpdatedAt} {
+	for _, iso := range []string{inc.UpdatedAt, inc.CreatedAt, inc.StartedAt} {
 		if iso == "" {
 			continue
 		}
 		if t, err := time.Parse(time.RFC3339, iso); err == nil {
-			return t.In(time.FixedZone("JST", 9*3600)).Format("1/2 15:04")
+			return t.In(time.FixedZone("JST", 9*3600)).Format("1/2 15:04") + " JST"
 		}
 	}
 	return "時刻不明"
