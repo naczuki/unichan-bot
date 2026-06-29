@@ -67,11 +67,11 @@ func publishEvent(ctx context.Context, ev nostr.Event) bool {
 	return atomic.LoadInt32(&successCount) > 0
 }
 
-// ── Status (Webhook由来の最新状態を保持) ────────────────
+// ── Status (直近のインシデント本文をメモリ保持) ─────────
 
-// status.claude.com への直接アクセス（API/HTML/Atom）は Fly.io のデータセンターIPから
-// bot判定(405)で弾かれる。そのため、Webhookで受け取った最新のインシデント本文を
-// メモリに保持し、メンション応答でもそれを返す。
+// メンション（「ステータス」等）への応答用に、webhook/poll で最後に投稿した
+// インシデント本文をメモリに保持する。応答のたびに status.claude.com を
+// 叩き直さずに済むようにするためのキャッシュ。
 type statusStore struct {
 	mu        sync.RWMutex
 	message   string    // 最後にWebhookで構築した本文
@@ -195,16 +195,23 @@ func formatIncidentLines(inc Incident) string {
 	return strings.Join(lines, "\n")
 }
 
-// postIncident は重複チェック→Nostr投稿→記録→latestStatus更新を一括で行う。
+// postIncident は重複チェック→Nostr投稿→latestStatus更新を一括で行う。
 // 投稿したら true、重複や失敗で投稿しなかったら false を返す。
+//
+// webhook と poll は併走するため、投稿の「前」に db.claim でキーを原子的に確保し、
+// 確保できた経路だけが投稿する。これにより同じインシデント更新が両経路から
+// 二重投稿されるレースを防ぐ。投稿に失敗した場合は unclaim でキーを戻し、
+// 次回（webhook再送やポーリング）でリトライできるようにする。
 func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, source string) bool {
 	key := inc.dedupKey()
-	dup, err := db.seen(key)
+	claimed, err := db.claim(key)
 	if err != nil {
+		// DBエラー時は安全側に倒して投稿しない（誤った二重投稿を避ける）。
 		log.Printf("❌ DB error (%s): %v", source, err)
-	}
-	if dup {
 		return false
+	}
+	if !claimed {
+		return false // 既に他経路が処理済み（重複）
 	}
 	content := formatIncidentLines(inc)
 	ev := nostr.Event{
@@ -215,15 +222,16 @@ func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, sourc
 	}
 	if err := ev.Sign(skHex); err != nil {
 		log.Printf("❌ Sign failed (%s): %v", source, err)
+		db.unclaim(key)
 		return false
 	}
 	if publishEvent(ctx, ev) {
-		db.markSeen(key)
 		latestStatus.set(content)
 		log.Printf("✅ Posted incident via %s: %s (%s)", source, inc.Name, inc.Status)
 		return true
 	}
 	log.Printf("⚠️ All relays failed (%s)", source)
+	db.unclaim(key)
 	return false
 }
 
@@ -317,8 +325,7 @@ func primeSeen(ctx context.Context, db *DB, client *http.Client) {
 	n := 0
 	for _, raw := range data.Incidents {
 		key := fmt.Sprintf("%s:%s", raw.ID, raw.UpdatedAt)
-		if seen, _ := db.seen(key); !seen {
-			db.markSeen(key)
+		if claimed, _ := db.claim(key); claimed {
 			n++
 		}
 	}
@@ -345,14 +352,6 @@ func newDB(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS polled_incidents (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		incident_key TEXT UNIQUE NOT NULL,
-		posted_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`)
-	if err != nil {
-		return nil, err
-	}
 	return &DB{db: db}, nil
 }
 
@@ -364,41 +363,39 @@ func (d *DB) isDuplicate(key string) (bool, error) {
 	return count > 0, err
 }
 
-// seen / markSeen は webhook とポーリングで共通のキー空間（webhook_logs）を使い、
-// 同じインシデント更新が両経路から二重投稿されるのを防ぐ。
+// seen は key が既に記録済みか確認するだけ（登録はしない）。
+// webhook ハンドラの早期重複応答など、副作用なしで判定したい箇所で使う。
 func (d *DB) seen(key string) (bool, error) {
 	return d.isDuplicate(key)
 }
 
-func (d *DB) markSeen(key string) error {
-	return d.record(key)
-}
-
-func (d *DB) record(key string) error {
+// claim は key を webhook_logs に登録し、今回新規に登録できたら true を返す。
+// INSERT OR IGNORE の RowsAffected を見ることで「確認」と「登録」を1つの
+// 操作で原子的に行い、webhook と poll が同じインシデントを同時処理しても
+// 二重投稿しないようにする。webhook とポーリングは共通のキー空間を使う。
+func (d *DB) claim(key string) (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
+	res, err := d.db.Exec(`INSERT OR IGNORE INTO webhook_logs (incident_key) VALUES (?)`, key)
+	if err != nil {
+		return false, err
+	}
 	if _, delErr := d.db.Exec(`DELETE FROM webhook_logs WHERE id NOT IN (SELECT id FROM webhook_logs ORDER BY id DESC LIMIT 300)`); delErr != nil {
 		log.Printf("⚠️ webhook_logs cleanup failed: %v", delErr)
 	}
-	return err
-}
-
-func (d *DB) isPolledDuplicate(key string) (bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	var count int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM polled_incidents WHERE incident_key = ?`, key).Scan(&count)
-	return count > 0, err
-}
-
-func (d *DB) recordPolled(key string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	_, err := d.db.Exec(`INSERT OR IGNORE INTO polled_incidents (incident_key) VALUES (?)`, key)
-	if _, delErr := d.db.Exec(`DELETE FROM polled_incidents WHERE id NOT IN (SELECT id FROM polled_incidents ORDER BY id DESC LIMIT 200)`); delErr != nil {
-		log.Printf("⚠️ polled_incidents cleanup failed: %v", delErr)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
 	}
+	return n > 0, nil
+}
+
+// unclaim は claim 済みの key を取り消す。投稿に失敗したときに呼び、
+// 次回（webhook再送やポーリング）でリトライできるようにする。
+func (d *DB) unclaim(key string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, err := d.db.Exec(`DELETE FROM webhook_logs WHERE incident_key = ?`, key)
 	return err
 }
 
@@ -505,8 +502,10 @@ func webhookHandler(ctx context.Context, db *DB, skHex string) http.HandlerFunc 
 			return
 		}
 
-		if payload.ComponentUpdate != nil {
-			fmt.Fprint(w, "Ignored (component_update)")
+		// component_update 単独（incident を伴わない）のときだけ無視する。
+		// incident が同居するペイロードでは下のインシデント処理に進める。
+		if payload.ComponentUpdate != nil && payload.Incident == nil {
+			fmt.Fprint(w, "Ignored (component_update only)")
 			return
 		}
 
