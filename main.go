@@ -21,14 +21,27 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Fly の外向きIPは US 扱いになることがあり、US を拒否するリレー（例: yabu.me の
-// "Country US not allowed"）には接続できない。そのため US ジオブロックのない
-// リレーを並べる。
+// postRelays は投稿・返信・通知の書き込み先。Fly の外向きIPは US 扱いになる
+// ことがあり、書き込みで US を拒否するリレー（yabu.me の "Country US not allowed"）
+// には publish できない。そのため書き込みは US ジオブロックのないリレーに限る。
+// （yabu.me は読み取りは通るので subRelays には残す。下記 subscribeMentions 参照）
 var postRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
 	"wss://relay.damus.io",
+}
+
+// subRelays はメンション購読（読み取り）先。読み取りは US でも通るので、JPユーザーの
+// 投稿先になりやすいリレー（yabu.me / r.kojira.io 等）を広めに購読してメンションの
+// 取りこぼしを防ぐ。書き込み不可の yabu.me もここには含める。
+var subRelays = []string{
+	"wss://nos.lol",
+	"wss://relay.nostr.wirednet.jp",
+	"wss://relay-jp.nostr.wirednet.jp",
+	"wss://relay.damus.io",
+	"wss://yabu.me",
+	"wss://r.kojira.io",
 }
 
 // ── Nostr ──────────────────────────────────────────────
@@ -483,7 +496,6 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 			Since: &since,
 		}}
 
-		subRelays := []string{"wss://nos.lol", "wss://relay.nostr.wirednet.jp", "wss://relay-jp.nostr.wirednet.jp", "wss://relay.damus.io"}
 		events := pool.SubMany(subCtx, subRelays, filters)
 		log.Printf("📡 Subscribed to mentions for %s", myPubkey)
 
