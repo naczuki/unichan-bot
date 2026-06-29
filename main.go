@@ -30,6 +30,7 @@ var postRelays = []string{
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
 	"wss://relay.damus.io",
+	"wss://r.kojira.io",
 }
 
 // subRelays はメンション購読（読み取り）先。読み取りは US でも通るので、JPユーザーの
