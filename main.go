@@ -156,16 +156,22 @@ func incidentTimeJST(inc incidentPayload) string {
 }
 
 // notifyOwner はオーナー宛に kind:1 ノート（p タグ付き）を投稿して通知する。
-// ステータス取得エラー／復旧の連絡に使う。ownerPubkey が空なら何もしない。
+// 本文冒頭に NIP-27 メンション（nostr:npub1...）を埋め込み、クライアントで
+// @表示されるようにする。ステータス取得エラー／復旧の連絡に使う。
+// ownerPubkey が空なら何もしない。
 func notifyOwner(ctx context.Context, skHex, ownerPubkey, msg string) {
 	if ownerPubkey == "" {
 		return
+	}
+	content := msg
+	if npub, err := nip19.EncodePublicKey(ownerPubkey); err == nil {
+		content = "nostr:" + npub + "\n" + msg
 	}
 	ev := nostr.Event{
 		Kind:      nostr.KindTextNote,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
 		Tags:      nostr.Tags{{"p", ownerPubkey}},
-		Content:   msg,
+		Content:   content,
 	}
 	if err := ev.Sign(skHex); err != nil {
 		log.Printf("❌ notifyOwner sign failed: %v", err)
@@ -363,9 +369,24 @@ func fetchIncidents(ctx context.Context, client *http.Client) (*incidentsRespons
 	return &parsed, nil
 }
 
+// fetchIncidentsWithRetry は一時的なタイムアウト等に備えて1回だけリトライする。
+// 最悪ケースでも 30s + 5s + 30s = 65s で、90秒のポーリング間隔に収まる。
+func fetchIncidentsWithRetry(ctx context.Context, client *http.Client) (*incidentsResponse, error) {
+	data, err := fetchIncidents(ctx, client)
+	if err == nil {
+		return data, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, err
+	case <-time.After(5 * time.Second):
+	}
+	return fetchIncidents(ctx, client)
+}
+
 func pollIncidents(ctx context.Context, db *DB, skHex, ownerPubkey string) {
 	const interval = 90 * time.Second
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -373,9 +394,11 @@ func pollIncidents(ctx context.Context, db *DB, skHex, ownerPubkey string) {
 	// （再起動のたびに過去インシデントを蒸し返さないため）。
 	primeSeen(ctx, db, client)
 
-	// failing: 直近の取得が失敗状態か。健全↔失敗の遷移時にだけオーナーへ通知する
-	// （失敗が続いても通知は最初の一回、復旧時にも一回だけ）。
-	failing := false
+	// 散発的なタイムアウトでは通知せず、failThreshold サイクル連続で失敗した
+	// ときにだけオーナーへ通知する（通知後は復旧時に一回だけ知らせる）。
+	const failThreshold = 3 // 90秒×3サイクル ≒ 4.5分の連続失敗で通知
+	consecFails := 0
+	notified := false
 
 	log.Printf("🔁 Incident polling started (interval=%s)", interval)
 	for {
@@ -383,20 +406,22 @@ func pollIncidents(ctx context.Context, db *DB, skHex, ownerPubkey string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			data, err := fetchIncidents(ctx, client)
+			data, err := fetchIncidentsWithRetry(ctx, client)
 			if err != nil {
-				log.Printf("⚠️ poll fetch failed: %v", err)
-				if !failing {
+				consecFails++
+				log.Printf("⚠️ poll fetch failed (%d連続): %v", consecFails, err)
+				if consecFails >= failThreshold && !notified {
 					notifyOwner(ctx, skHex, ownerPubkey,
 						fmt.Sprintf("⚠️ ステータスの取得に失敗してるみたい…\nエラー: %v\n\n直ったらまた知らせるね！", err))
-					failing = true
+					notified = true
 				}
 				continue
 			}
-			if failing {
+			if notified {
 				notifyOwner(ctx, skHex, ownerPubkey, "✅ ステータスの取得が復活したよ！")
-				failing = false
 			}
+			consecFails = 0
+			notified = false
 			incidentList.set(data.Incidents)
 			for _, raw := range data.Incidents {
 				postIncident(ctx, db, skHex, raw.toIncident(), "poll")
@@ -407,7 +432,7 @@ func pollIncidents(ctx context.Context, db *DB, skHex, ownerPubkey string) {
 
 // primeSeen は起動時に現在のインシデント群を既読として記録するだけ（投稿しない）。
 func primeSeen(ctx context.Context, db *DB, client *http.Client) {
-	data, err := fetchIncidents(ctx, client)
+	data, err := fetchIncidentsWithRetry(ctx, client)
 	if err != nil {
 		log.Printf("⚠️ primeSeen fetch failed (起動時の既読登録をスキップ): %v", err)
 		return
