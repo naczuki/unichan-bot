@@ -29,7 +29,7 @@ var postRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
-	"wss://relay.damus.io",
+	"wss://relay.primal.net",
 	"wss://r.kojira.io",
 }
 
@@ -40,7 +40,7 @@ var subRelays = []string{
 	"wss://nos.lol",
 	"wss://relay.nostr.wirednet.jp",
 	"wss://relay-jp.nostr.wirednet.jp",
-	"wss://relay.damus.io",
+	"wss://relay.primal.net",
 	"wss://yabu.me",
 	"wss://r.kojira.io",
 }
