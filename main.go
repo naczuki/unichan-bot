@@ -534,7 +534,7 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 				if strings.Contains(lower, "ステータス") || strings.Contains(lower, "status") {
 					msg = buildStatusMessage()
 				} else {
-					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "とげとげ〜！", "だいすき〜！", "監視中！👀"}
+					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "とげとげ〜！", "だいすき〜！", "監視中！👀", "うにー！これ見て〜 https://youtu.be/Chb0xKDTPQA"}
 					msg = cries[time.Now().UnixNano()%int64(len(cries))]
 				}
 				reply := nostr.Event{
