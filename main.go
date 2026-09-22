@@ -85,6 +85,109 @@ func publishEvent(ctx context.Context, ev nostr.Event) bool {
 	return atomic.LoadInt32(&successCount) > 0
 }
 
+// urlTags は本文に含まれる http(s) URL を NIP-24 の `r`（参照）タグにして返す。
+// タグは必ず投稿本文から組み立て、本文とタグの参照先がずれないようにする。
+func urlTags(content string) nostr.Tags {
+	tags := nostr.Tags{}
+	seen := map[string]bool{}
+	for _, field := range strings.Fields(content) {
+		if !strings.HasPrefix(field, "http://") && !strings.HasPrefix(field, "https://") {
+			continue
+		}
+		u := strings.TrimRight(field, ".,;:!?)]}\"'、。）」』】！？")
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		tags = append(tags, nostr.Tag{"r", u})
+	}
+	return tags
+}
+
+// ── プロフィール（kind:0）──────────────────────────────
+
+// ensureBotFlag は kind:0 に NIP-24 の "bot": true を立てる。kind:0 は置換
+// イベントなので、既存プロフィールを取得して bot だけ足して publish する
+// （name や picture を消さないため）。取得できなかったときは上書きで既存
+// プロフィールを失わないよう、何もしない。
+func ensureBotFlag(ctx context.Context, skHex, pubkey string) {
+	current := fetchProfile(ctx, pubkey)
+	if current == nil {
+		log.Printf("⚠️ kind:0 を取得できなかったので bot フラグの設定を見送り")
+		return
+	}
+	var profile map[string]any
+	if err := json.Unmarshal([]byte(current.Content), &profile); err != nil {
+		log.Printf("⚠️ kind:0 のJSONを解釈できないので bot フラグの設定を見送り: %v", err)
+		return
+	}
+	if bot, ok := profile["bot"].(bool); ok && bot {
+		log.Printf("🤖 kind:0 の bot フラグは設定済み")
+		return
+	}
+	profile["bot"] = true
+	content, err := json.Marshal(profile)
+	if err != nil {
+		log.Printf("❌ kind:0 のJSON生成に失敗: %v", err)
+		return
+	}
+	ev := nostr.Event{
+		Kind:      nostr.KindProfileMetadata,
+		CreatedAt: nostr.Timestamp(time.Now().Unix()),
+		Tags:      current.Tags,
+		Content:   string(content),
+	}
+	if err := ev.Sign(skHex); err != nil {
+		log.Printf("❌ kind:0 の署名に失敗: %v", err)
+		return
+	}
+	if publishEvent(ctx, ev) {
+		log.Printf("🤖 kind:0 に bot フラグを設定した")
+	}
+}
+
+// fetchProfile は subRelays から kind:0 を取得する。リレーごとに古い版が
+// 残っていることがあるため、取得できた中で created_at が最新のものを返す。
+func fetchProfile(ctx context.Context, pubkey string) *nostr.Event {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	filter := nostr.Filter{
+		Kinds:   []int{nostr.KindProfileMetadata},
+		Authors: []string{pubkey},
+		Limit:   1,
+	}
+	var mu sync.Mutex
+	var latest *nostr.Event
+	var wg sync.WaitGroup
+	for _, url := range subRelays {
+		url := url
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			relay, err := nostr.RelayConnect(ctx, url)
+			if err != nil {
+				log.Printf("⚠️ kind:0 取得の接続に失敗 (%s): %v", url, err)
+				return
+			}
+			defer relay.Close()
+			events, err := relay.QuerySync(ctx, filter)
+			if err != nil {
+				log.Printf("⚠️ kind:0 の取得に失敗 (%s): %v", url, err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, e := range events {
+				if latest == nil || e.CreatedAt > latest.CreatedAt {
+					latest = e
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return latest
+}
+
 // ── Status (進行中インシデントのスナップショットを保持) ──
 
 // incidentSnapshot は poll が取得した最新のインシデント一覧をメモリに保持する。
@@ -290,7 +393,7 @@ func postIncident(ctx context.Context, db *DB, skHex string, inc Incident, sourc
 	ev := nostr.Event{
 		Kind:      nostr.KindTextNote,
 		CreatedAt: nostr.Timestamp(time.Now().Unix()),
-		Tags:      nostr.Tags{},
+		Tags:      urlTags(content),
 		Content:   content,
 	}
 	if err := ev.Sign(skHex); err != nil {
@@ -537,14 +640,16 @@ func subscribeMentions(ctx context.Context, skHex string, myPubkey string) {
 					cries := []string{"うにー！", "うににー！", "うにちゃんだよ！", "うにゅ！", "うにゅう！", "うにぃ！", "うにうに！", "よんだ？", "はーい！", "とげとげ〜！", "だいすき〜！", "監視中！👀", "うにー！これ見て〜 https://youtu.be/Chb0xKDTPQA"}
 					msg = cries[time.Now().UnixNano()%int64(len(cries))]
 				}
+				tags := nostr.Tags{
+					{"e", ev.ID, "", "reply"},
+					{"p", ev.PubKey},
+				}
+				tags = append(tags, urlTags(msg)...)
 				reply := nostr.Event{
 					Kind:      nostr.KindTextNote,
 					CreatedAt: nostr.Timestamp(time.Now().Unix()),
-					Tags: nostr.Tags{
-						{"e", ev.ID, "", "reply"},
-						{"p", ev.PubKey},
-					},
-					Content: msg,
+					Tags:      tags,
+					Content:   msg,
 				}
 				if err := reply.Sign(skHex); err != nil {
 					log.Printf("❌ Sign failed: %v", err)
@@ -699,6 +804,9 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// kind:0 の bot フラグ（NIP-24）を確認し、未設定なら立てる
+	go ensureBotFlag(ctx, skHex, pubkey)
 
 	go subscribeMentions(ctx, skHex, pubkey)
 
